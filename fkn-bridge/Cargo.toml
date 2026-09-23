@@ -1,0 +1,48 @@
+[package]
+name = "fkn-codex-bridge"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[[bin]]
+name = "fkn-codex-bridge"
+path = "src/main.rs"
+
+[[bin]]
+name = "fkn-mcp-smoke"
+path = "src/bin/mcp_smoke.rs"
+
+[[bin]]
+name = "fkn-codex"
+path = "src/bin/fkn-codex/main.rs"
+
+[[bin]]
+name = "fkn-codex-auth-shim"
+path = "src/bin/fkn_codex_auth_shim.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
+libc = "0.2"
+ratatui = "0.29"
+rmcp = { version = "=3.2.0", default-features = false, features = [
+    "client",
+    "server",
+    "transport-streamable-http-client-reqwest",
+    "transport-streamable-http-server",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
