@@ -3,7 +3,8 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -13,6 +14,8 @@ use std::time::{Duration, Instant};
 use super::settings::{AppPaths, Settings};
 
 const MAX_LOG_LINES: usize = 300;
+const TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const RESTART_BACKOFF: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct Binaries {
@@ -145,6 +148,9 @@ pub struct RuntimeController {
     health_url: Option<String>,
     state_dir: PathBuf,
     logs: Arc<Mutex<VecDeque<String>>>,
+    keep_bridge_running: bool,
+    keep_tunnel_running: bool,
+    next_restart_at: Option<Instant>,
 }
 
 impl RuntimeController {
@@ -157,6 +163,9 @@ impl RuntimeController {
             health_url: None,
             state_dir,
             logs: Arc::new(Mutex::new(VecDeque::new())),
+            keep_bridge_running: false,
+            keep_tunnel_running: false,
+            next_restart_at: None,
         })
     }
 
@@ -215,6 +224,9 @@ impl RuntimeController {
         if !self.tunnel_running() {
             self.start_tunnel(paths, settings, binaries)?;
         }
+        self.keep_bridge_running = true;
+        self.keep_tunnel_running = true;
+        self.next_restart_at = None;
         Ok(())
     }
 
@@ -228,10 +240,62 @@ impl RuntimeController {
         if !self.tunnel_running() {
             self.start_tunnel(paths, settings, binaries)?;
         }
+        self.keep_bridge_running = true;
+        self.keep_tunnel_running = true;
+        self.next_restart_at = None;
         Ok(())
     }
 
+    pub fn maintain(
+        &mut self,
+        workspace: &Path,
+        paths: &AppPaths,
+        settings: &Settings,
+        binaries: &Binaries,
+    ) {
+        if !self.keep_bridge_running
+            || self
+                .next_restart_at
+                .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            return;
+        }
+
+        let bridge_alive = self.bridge_running();
+        let tunnel_alive = self.tunnel_running();
+        let result = if !bridge_alive {
+            if let Some(mut tunnel) = self.tunnel.take() {
+                terminate_process_tree(&mut tunnel);
+            }
+            self.health_url = None;
+            let _ = fs::remove_file(self.state_dir.join("tunnel-health.url"));
+            self.push_log("local bridge stopped; restarting runtime");
+            self.start_bridge(workspace, paths, settings, binaries)
+                .and_then(|()| {
+                    if self.keep_tunnel_running {
+                        self.start_tunnel(paths, settings, binaries)
+                    } else {
+                        Ok(())
+                    }
+                })
+        } else if self.keep_tunnel_running && !tunnel_alive {
+            self.push_log("OpenAI tunnel stopped; reconnecting");
+            self.start_tunnel(paths, settings, binaries)
+        } else {
+            return;
+        };
+
+        if let Err(error) = result {
+            self.push_log(format!("automatic runtime recovery failed: {error:#}"));
+            self.next_restart_at = Some(Instant::now() + RESTART_BACKOFF);
+        } else {
+            self.next_restart_at = None;
+            self.push_log("automatic runtime recovery completed");
+        }
+    }
+
     pub fn pause(&mut self) {
+        self.keep_tunnel_running = false;
         if let Some(mut tunnel) = self.tunnel.take() {
             terminate_process_tree(&mut tunnel);
         }
@@ -241,6 +305,9 @@ impl RuntimeController {
     }
 
     pub fn stop(&mut self) {
+        self.keep_bridge_running = false;
+        self.keep_tunnel_running = false;
+        self.next_restart_at = None;
         self.pause();
         if let Some(mut bridge) = self.bridge.take() {
             terminate_process_tree(&mut bridge);
@@ -305,23 +372,38 @@ impl RuntimeController {
         capture_output(&mut child, Arc::clone(&self.logs), "bridge");
 
         let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
+        let startup = loop {
             if let Ok(text) = fs::read_to_string(&ready_file)
                 && let Ok(ready) = serde_json::from_str::<BridgeReady>(&text)
             {
-                self.mcp_url = Some(ready.mcp_url);
+                break Ok(ready.mcp_url);
+            }
+            match child.try_wait().context("read bridge status") {
+                Ok(Some(status)) => {
+                    break Err(anyhow::anyhow!(
+                        "local bridge exited during startup with {status}"
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => break Err(error),
+            }
+            if Instant::now() >= deadline {
+                break Err(anyhow::anyhow!("timed out waiting for local bridge"));
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        match startup {
+            Ok(mcp_url) => {
+                self.mcp_url = Some(mcp_url);
                 self.bridge = Some(child);
                 self.push_log("local bridge ready");
-                return Ok(());
+                Ok(())
             }
-            if let Some(status) = child.try_wait().context("read bridge status")? {
-                anyhow::bail!("local bridge exited during startup with {status}");
+            Err(error) => {
+                terminate_process_tree(&mut child);
+                let _ = fs::remove_file(&ready_file);
+                Err(error)
             }
-            anyhow::ensure!(
-                Instant::now() < deadline,
-                "timed out waiting for local bridge"
-            );
-            thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -365,12 +447,26 @@ impl RuntimeController {
             .arg("info")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(proxy) = control_plane_proxy() {
+            command.arg("--control-plane.http-proxy").arg(proxy);
+            self.push_log("using configured proxy for OpenAI control-plane");
+        }
         configure_process_group(&mut command);
         let mut child = command.spawn().context("start OpenAI tunnel-client")?;
         capture_output(&mut child, Arc::clone(&self.logs), "tunnel");
-        self.tunnel = Some(child);
-        self.push_log("OpenAI tunnel started");
-        Ok(())
+        match wait_for_tunnel_ready(&mut child, &health_file) {
+            Ok(health_url) => {
+                self.health_url = Some(health_url);
+                self.tunnel = Some(child);
+                self.push_log("OpenAI tunnel ready");
+                Ok(())
+            }
+            Err(error) => {
+                terminate_process_tree(&mut child);
+                let _ = fs::remove_file(&health_file);
+                Err(error)
+            }
+        }
     }
 
     fn push_log(&self, line: impl Into<String>) {
@@ -424,6 +520,86 @@ fn push_log(logs: &Arc<Mutex<VecDeque<String>>>, line: String) {
     }
 }
 
+fn control_plane_proxy() -> Option<String> {
+    [
+        "FKN_TUNNEL_CONTROL_PLANE_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "HTTP_PROXY",
+    ]
+    .into_iter()
+    .find_map(|name| std::env::var(name).ok().and_then(normalize_proxy))
+    .or_else(windows_system_proxy)
+}
+
+fn normalize_proxy(value: String) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let selected = value
+        .split(';')
+        .find_map(|entry| {
+            let (kind, proxy) = entry.split_once('=')?;
+            kind.trim()
+                .eq_ignore_ascii_case("https")
+                .then_some(proxy.trim())
+        })
+        .or_else(|| {
+            value
+                .split(';')
+                .find_map(|entry| entry.split_once('=').map(|(_, proxy)| proxy.trim()))
+        })
+        .unwrap_or(value);
+    if selected.is_empty() {
+        None
+    } else if selected.contains("://") {
+        Some(selected.to_string())
+    } else {
+        Some(format!("http://{selected}"))
+    }
+}
+
+#[cfg(windows)]
+fn windows_system_proxy() -> Option<String> {
+    use std::os::windows::process::CommandExt as _;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const INTERNET_SETTINGS: &str =
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    let query = |value: &str| {
+        Command::new("reg.exe")
+            .args(["query", INTERNET_SETTINGS, "/v", value])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+    };
+    let enabled = query("ProxyEnable")?;
+    if !enabled
+        .split_whitespace()
+        .any(|token| token == "0x1" || token == "1")
+    {
+        return None;
+    }
+    let server = query("ProxyServer")?;
+    let value = server
+        .lines()
+        .find(|line| line.contains("ProxyServer"))?
+        .split_whitespace()
+        .last()?
+        .to_string();
+    normalize_proxy(value)
+}
+
+#[cfg(not(windows))]
+fn windows_system_proxy() -> Option<String> {
+    None
+}
+
 #[cfg(unix)]
 fn configure_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt as _;
@@ -451,8 +627,88 @@ fn terminate_process_tree(child: &mut Child) {
     let _ = child.wait();
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn terminate_process_tree(child: &mut Child) {
+    use std::os::windows::process::CommandExt as _;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let pid = child.id().to_string();
+    let terminated = Command::new("taskkill.exe")
+        .args(["/PID", &pid, "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .is_ok_and(|status| status.success());
+    if !terminated {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+fn wait_for_tunnel_ready(child: &mut Child, health_file: &Path) -> Result<String> {
+    let deadline = Instant::now() + TUNNEL_READY_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait().context("read tunnel status")? {
+            anyhow::bail!(
+                "OpenAI tunnel-client exited during startup with {status}. Use a runtime API key from Organization > API keys and verify Tunnels Read + Use"
+            );
+        }
+        if let Ok(health_url) = fs::read_to_string(health_file) {
+            let health_url = health_url.trim();
+            if !health_url.is_empty() && tunnel_is_ready(health_url) {
+                return Ok(health_url.to_string());
+            }
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "OpenAI tunnel did not become ready. Use a runtime API key from Organization > API keys and verify Tunnels Read + Use and the ChatGPT workspace association"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn tunnel_is_ready(health_url: &str) -> bool {
+    let Some(authority) = health_url
+        .strip_prefix("http://")
+        .map(|value| value.trim_end_matches('/'))
+    else {
+        return false;
+    };
+    let Ok(address) = authority.parse::<SocketAddr>() else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(250)) else {
+        return false;
+    };
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .is_err()
+        || stream
+            .set_write_timeout(Some(Duration::from_millis(250)))
+            .is_err()
+    {
+        return false;
+    }
+    let request = format!("GET /readyz HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut status_line = String::new();
+    let Ok(read) = BufReader::new(stream).read_line(&mut status_line) else {
+        return false;
+    };
+    read > 0
+        && (status_line.starts_with("HTTP/1.1 200 ") || status_line.starts_with("HTTP/1.0 200 "))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn terminate_process_tree(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[cfg(test)]
+#[path = "runtime_tests.rs"]
+mod tests;

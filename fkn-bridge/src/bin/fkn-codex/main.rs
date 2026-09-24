@@ -356,6 +356,8 @@ fn run_tui(mut app: App) -> Result<()> {
         }
         if last_tick.elapsed() >= tick_rate {
             app.runtime.refresh();
+            app.runtime
+                .maintain(&app.workspace, &app.paths, &app.settings, &app.binaries);
             last_tick = Instant::now();
         }
     }

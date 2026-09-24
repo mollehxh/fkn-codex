@@ -6,12 +6,15 @@ use clap::Parser;
 use clap::ValueEnum;
 use desktop_runtime::DesktopRuntimeLocator;
 use fkn_codex_bridge::Bridge;
+use fkn_codex_bridge::CodexAccessMode;
 use fkn_codex_bridge::build_router;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::net::TcpListener;
 use tokio::process::Command;
+
+const CODEX_RESTART_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -63,6 +66,14 @@ impl SandboxMode {
             Self::ReadOnly => "read-only",
             Self::WorkspaceWrite => "workspace-write",
             Self::DangerFullAccess => "danger-full-access",
+        }
+    }
+
+    fn as_bridge_access(self) -> CodexAccessMode {
+        match self {
+            Self::ReadOnly => CodexAccessMode::ReadOnly,
+            Self::WorkspaceWrite => CodexAccessMode::WorkspaceWrite,
+            Self::DangerFullAccess => CodexAccessMode::DangerFullAccess,
         }
     }
 }
@@ -118,6 +129,7 @@ async fn main() -> Result<()> {
         args.workspace.clone(),
         args.codex_bin.clone(),
         args.codex_home.clone(),
+        args.sandbox.as_bridge_access(),
     );
     let bridge = if desktop_runtime.is_some() {
         bridge.with_cua_tools()
@@ -149,6 +161,7 @@ async fn main() -> Result<()> {
     );
     let mut codex = Command::new(&args.codex_bin);
     codex
+        .kill_on_drop(true)
         .arg("exec")
         .arg("--skip-git-repo-check")
         .arg("--model")
@@ -190,7 +203,6 @@ async fn main() -> Result<()> {
                 .expect("CUA auth source home resolved"),
         );
     }
-
     let mut child = codex.spawn().context("spawn bundled Codex")?;
 
     if let Some(path) = &args.ready_file {
@@ -215,7 +227,11 @@ async fn main() -> Result<()> {
                 break;
             }
             if let Some(status) = child.try_wait().context("poll bundled Codex")? {
-                anyhow::bail!("bundled Codex exited during startup with {status}");
+                eprintln!("[bridge] bundled Codex exited during startup with {status}; restarting");
+                tokio::time::sleep(CODEX_RESTART_BACKOFF).await;
+                child = codex
+                    .spawn()
+                    .context("restart bundled Codex during startup")?;
             }
             anyhow::ensure!(
                 tokio::time::Instant::now() < deadline,
@@ -231,9 +247,10 @@ async fn main() -> Result<()> {
                 let status = status.context("wait for bundled Codex")?;
                 bridge.reset_runtime_registry().await;
                 if !status.success() {
-                    anyhow::bail!("bundled Codex exited with {status}");
+                    eprintln!("[bridge] bundled Codex exited with {status}; restarting");
+                    tokio::time::sleep(CODEX_RESTART_BACKOFF).await;
                 }
-                child = codex.spawn().context("restart bundled Codex after completed turn")?;
+                child = codex.spawn().context("restart bundled Codex")?;
             }
             result = &mut server => {
                 result.context("join bridge HTTP server")??;

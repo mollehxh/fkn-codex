@@ -1,3 +1,4 @@
+mod server_context;
 mod tool_registry;
 
 use anyhow::Context as _;
@@ -33,6 +34,7 @@ use rmcp::transport::StreamableHttpService;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use serde_json::Value;
 use serde_json::json;
+pub use server_context::CodexAccessMode;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -84,6 +86,7 @@ struct CodexRuntime {
     workspace: PathBuf,
     codex_bin: PathBuf,
     codex_home: PathBuf,
+    access_mode: CodexAccessMode,
 }
 
 #[derive(Clone)]
@@ -108,12 +111,18 @@ impl Default for Bridge {
 }
 
 impl Bridge {
-    pub fn new(workspace: PathBuf, codex_bin: PathBuf, codex_home: PathBuf) -> Self {
+    pub fn new(
+        workspace: PathBuf,
+        codex_bin: PathBuf,
+        codex_home: PathBuf,
+        access_mode: CodexAccessMode,
+    ) -> Self {
         Self {
             runtime: Some(Arc::new(CodexRuntime {
                 workspace,
                 codex_bin,
                 codex_home,
+                access_mode,
             })),
             ..Self::default()
         }
@@ -122,6 +131,16 @@ impl Bridge {
     pub fn with_cua_tools(mut self) -> Self {
         self.preload_cua_tools = true;
         self
+    }
+
+    fn server_instructions(&self) -> Option<String> {
+        let runtime = self.runtime.as_deref()?;
+        let computer_use = if self.preload_cua_tools {
+            server_context::ComputerUseStatus::Enabled
+        } else {
+            server_context::ComputerUseStatus::Disabled
+        };
+        server_context::render(&runtime.workspace, runtime.access_mode, computer_use)
     }
 
     pub async fn skills_list(&self, force_reload: bool) -> Result<Value> {
@@ -746,16 +765,36 @@ impl BridgeMcpHandler {
         }
         tools
     }
+
+    fn tools_for_bridge(&self, registry: &[Value]) -> Vec<Tool> {
+        let mut tools = Self::tools_for_registry(registry);
+        if let Some(instructions) = self.bridge.server_instructions()
+            && let Some(tool) = tools
+                .iter_mut()
+                .find(|tool| tool.name == "codex_skills_list")
+        {
+            let description = tool.description.as_deref().unwrap_or_default();
+            tool.description = Some(Cow::Owned(format!(
+                "MCP server instructions (mirrored for clients that omit InitializeResult.instructions): {instructions}\n\n{}",
+                description
+            )));
+        }
+        tools
+    }
 }
 
 impl ServerHandler for BridgeMcpHandler {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+        let info = ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
                 .build(),
-        )
+        );
+        match self.bridge.server_instructions() {
+            Some(instructions) => info.with_instructions(instructions),
+            None => info,
+        }
     }
 
     async fn list_tools(
@@ -764,9 +803,9 @@ impl ServerHandler for BridgeMcpHandler {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let registry = self.bridge.state.lock().await.tools.clone();
-        Ok(ListToolsResult::with_all_items(Self::tools_for_registry(
-            &registry,
-        )))
+        Ok(ListToolsResult::with_all_items(
+            self.tools_for_bridge(&registry),
+        ))
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {

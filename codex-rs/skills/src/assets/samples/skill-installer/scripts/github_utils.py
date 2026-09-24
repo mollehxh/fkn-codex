@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import urllib.error
 import urllib.request
 
 
@@ -13,7 +14,15 @@ def github_request(url: str, user_agent: str) -> bytes:
     if token:
         headers["Authorization"] = f"token {token}"
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req) as resp:
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as error:
+        if not token or error.code != 401:
+            raise
+        error.close()
+    anonymous_req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+    with urllib.request.urlopen(anonymous_req) as resp:
         return resp.read()
 
 

@@ -10,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+import urllib.error
 
 
 INSTALLER = (
@@ -21,6 +23,38 @@ INSTALLER = (
     / "scripts"
     / "install-skill-from-github.py"
 )
+SCRIPTS = INSTALLER.parent
+sys.path.insert(0, str(SCRIPTS))
+import github_utils  # noqa: E402
+
+
+class SkillInstallerGitHubRequestTests(unittest.TestCase):
+    def test_retries_anonymously_when_configured_token_is_rejected(self) -> None:
+        requests = []
+
+        def urlopen(request):
+            requests.append(request)
+            if len(requests) == 1:
+                raise urllib.error.HTTPError(
+                    request.full_url, 401, "Unauthorized", {}, None
+                )
+            return mock.MagicMock(
+                __enter__=mock.Mock(
+                    return_value=mock.Mock(read=mock.Mock(return_value=b"public"))
+                ),
+                __exit__=mock.Mock(return_value=False),
+            )
+
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "expired"}):
+            with mock.patch.object(github_utils.urllib.request, "urlopen", urlopen):
+                result = github_utils.github_request(
+                    "https://api.github.com/repos/openai/skills/contents/skills/.curated",
+                    "skill-installer-test",
+                )
+
+        self.assertEqual(result, b"public")
+        self.assertEqual(requests[0].get_header("Authorization"), "token expired")
+        self.assertIsNone(requests[1].get_header("Authorization"))
 
 
 class SkillInstallerSymlinkTests(unittest.TestCase):

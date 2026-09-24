@@ -181,3 +181,51 @@ fn malformed_image_output_keeps_the_structured_payload() {
     assert_eq!(result.structured_content, Some(json!({"output": output})));
     assert_eq!(result.content, vec![ContentBlock::text(output.to_string())]);
 }
+
+#[test]
+fn mcp_server_instructions_include_bounded_local_codex_context() {
+    let long_workspace = "я".repeat(server_context::MAX_SERVER_INSTRUCTIONS_BYTES);
+    let bridge = Bridge::new(
+        PathBuf::from(long_workspace),
+        PathBuf::from("codex"),
+        PathBuf::from("codex-home"),
+        CodexAccessMode::DangerFullAccess,
+    )
+    .with_cua_tools();
+    let instructions = BridgeMcpHandler { bridge }.get_info().instructions.unwrap();
+
+    assert!(instructions.len() <= server_context::MAX_SERVER_INSTRUCTIONS_BYTES);
+    assert!(instructions.is_char_boundary(instructions.len()));
+    assert!(instructions.contains("Local Codex controller"));
+    assert!(instructions.contains("access=danger-full-access"));
+    assert!(instructions.contains("computer_use=enabled"));
+}
+
+#[test]
+fn server_context_is_mirrored_once_into_visible_tool_metadata() {
+    let bridge = Bridge::new(
+        PathBuf::from(r"C:\work\project"),
+        PathBuf::from("codex"),
+        PathBuf::from("codex-home"),
+        CodexAccessMode::DangerFullAccess,
+    );
+    let instructions = bridge.server_instructions().unwrap();
+    let tools = BridgeMcpHandler {
+        bridge: bridge.clone(),
+    }
+    .tools_for_bridge(&[]);
+    let skills_list = tools
+        .iter()
+        .find(|tool| tool.name == "codex_skills_list")
+        .unwrap();
+    let skill_get = tools
+        .iter()
+        .find(|tool| tool.name == "codex_skill_get")
+        .unwrap();
+    let skills_list_description = skills_list.description.as_deref().unwrap();
+    let skill_get_description = skill_get.description.as_deref().unwrap();
+
+    assert!(skills_list_description.contains("MCP server instructions (mirrored"));
+    assert!(skills_list_description.contains(&instructions));
+    assert!(!skill_get_description.contains("MCP server instructions"));
+}

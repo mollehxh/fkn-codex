@@ -20,6 +20,7 @@ const child = spawn(bridgeBin, [
   "--workspace", workspace,
   "--codex-bin", codexBin,
   "--codex-home", codexHome,
+  "--sandbox", "danger-full-access",
   "--disable-cua",
   "--listen", "127.0.0.1:0",
   "--ready-file", readyFile,
@@ -63,7 +64,18 @@ try {
   mcpUrl = (await waitForReadyFile()).mcp_url;
   const initialized = await rpc(1, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fkn-direct-tools-smoke", version: "1" } });
   if (initialized.capabilities?.tools?.listChanged !== true) throw new Error("Bridge did not advertise dynamic tool-list notifications");
+  const cwdStart = initialized.instructions?.indexOf("; cwd=") ?? -1;
+  const cwdEnd = initialized.instructions?.indexOf(". Treat cwd", cwdStart) ?? -1;
+  if (cwdStart < 0 || cwdEnd < 0) throw new Error(`MCP server instructions did not include the local workspace: ${initialized.instructions}`);
+  const advertisedWorkspace = JSON.parse(initialized.instructions.slice(cwdStart + 6, cwdEnd));
+  const normalizeWindowsPath = (value) => process.platform === "win32" ? value.replace(/^\\\\\?\\/, "").toLowerCase() : value;
+  if (normalizeWindowsPath(advertisedWorkspace) !== normalizeWindowsPath(await realpath(workspace))) throw new Error(`MCP server instructions advertised the wrong workspace: ${initialized.instructions}`);
+  if (!initialized.instructions?.includes("access=danger-full-access")) throw new Error(`MCP server instructions did not include the access mode: ${initialized.instructions}`);
+  if (Buffer.byteLength(initialized.instructions, "utf8") > 1024) throw new Error("MCP server instructions exceeded the bounded context size");
   const first = await rpc(2, "tools/list", {});
+  const skillsList = first.tools?.find((tool) => tool.name === "codex_skills_list");
+  if (!skillsList?.description?.includes("MCP server instructions (mirrored")) throw new Error("MCP server context was not mirrored into ChatGPT-visible tool metadata");
+  if (!skillsList.description.includes("access=danger-full-access")) throw new Error("Mirrored MCP server context omitted the access mode");
   if (!first.tools?.some((tool) => tool.name === "exec_command")) throw new Error("First Codex turn did not publish exec_command directly");
   if (first.tools?.some((tool) => tool.name.startsWith("mcp__cua_repl__"))) throw new Error("CUA tools were advertised while CUA was disabled");
   const command = await rpc(3, "tools/call", {
@@ -80,8 +92,18 @@ try {
   console.log("PASS: direct tools execute and optional CUA stays hidden when disabled");
 } finally {
   if (!exited) {
-    if (process.platform === "win32") child.kill();
-    else process.kill(-child.pid, "SIGTERM");
+    if (process.platform === "win32") {
+      const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+      await new Promise((resolveKill, rejectKill) => {
+        killer.once("error", rejectKill);
+        killer.once("exit", resolveKill);
+      });
+    } else {
+      process.kill(-child.pid, "SIGTERM");
+    }
+    if (!exited) {
+      await new Promise((resolveExit) => child.once("exit", resolveExit));
+    }
   }
-  await rm(scratch, { recursive: true, force: true });
+  await rm(scratch, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 }
