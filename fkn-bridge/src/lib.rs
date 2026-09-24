@@ -1,3 +1,5 @@
+mod tool_registry;
+
 use anyhow::Context as _;
 use anyhow::Result;
 use axum::Router;
@@ -11,6 +13,7 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::post;
 use rmcp::ErrorData as McpError;
+use rmcp::Peer;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::CallToolResult;
@@ -22,6 +25,7 @@ use rmcp::model::ServerCapabilities;
 use rmcp::model::ServerInfo;
 use rmcp::model::Tool;
 use rmcp::model::ToolAnnotations;
+use rmcp::service::NotificationContext;
 use rmcp::service::RequestContext;
 use rmcp::service::RoleServer;
 use rmcp::transport::StreamableHttpServerConfig;
@@ -44,12 +48,16 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
+use tool_registry::DirectTool;
+use tool_registry::NativeToolCallType;
+use tool_registry::direct_tools;
+use tool_registry::find_direct_tool;
 
 #[derive(Debug)]
 enum ModelReply {
     ToolCall {
         call_id: String,
-        call_type: ToolCallType,
+        call_type: NativeToolCallType,
         namespace: Option<String>,
         name: String,
         payload: Value,
@@ -57,32 +65,16 @@ enum ModelReply {
     ToolSearch {
         call_id: String,
         query: String,
-        limit: Option<u64>,
+        limit: u64,
     },
-    Finish {
-        message: String,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ToolCallType {
-    Function,
-    Custom,
-}
-
-impl ToolCallType {
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "function" => Some(Self::Function),
-            "custom" => Some(Self::Custom),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Default)]
 struct BridgeState {
     tools: Vec<Value>,
+    peers: Vec<Peer<RoleServer>>,
+    cua_preload_completed: bool,
+    runtime_reset: bool,
     pending_model_response: Option<oneshot::Sender<ModelReply>>,
     pending_tool_results: HashMap<String, oneshot::Sender<Value>>,
 }
@@ -100,6 +92,7 @@ pub struct Bridge {
     model_request_ready: Arc<Notify>,
     sequence: Arc<AtomicU64>,
     runtime: Option<Arc<CodexRuntime>>,
+    preload_cua_tools: bool,
 }
 
 impl Default for Bridge {
@@ -109,6 +102,7 @@ impl Default for Bridge {
             model_request_ready: Arc::new(Notify::new()),
             sequence: Arc::new(AtomicU64::new(0)),
             runtime: None,
+            preload_cua_tools: false,
         }
     }
 }
@@ -123,6 +117,11 @@ impl Bridge {
             })),
             ..Self::default()
         }
+    }
+
+    pub fn with_cua_tools(mut self) -> Self {
+        self.preload_cua_tools = true;
+        self
     }
 
     pub async fn skills_list(&self, force_reload: bool) -> Result<Value> {
@@ -181,16 +180,45 @@ impl Bridge {
             "content": content,
         }))
     }
-    pub async fn inventory(&self) -> Value {
-        let state = self.state.lock().await;
-        json!({
-            "ready": state.pending_model_response.is_some(),
-            "tools": state.tools,
-        })
-    }
-
     pub async fn is_ready(&self) -> bool {
         self.state.lock().await.pending_model_response.is_some()
+    }
+
+    async fn register_peer(&self, peer: Peer<RoleServer>) {
+        let mut state = self.state.lock().await;
+        state.peers.retain(|peer| !peer.is_transport_closed());
+        state.peers.push(peer);
+    }
+
+    async fn notify_tool_list_changed(&self) {
+        let peers = std::mem::take(&mut self.state.lock().await.peers);
+        let mut active_peers = Vec::new();
+        for peer in peers.into_iter().filter(|peer| !peer.is_transport_closed()) {
+            match peer.notify_tool_list_changed().await {
+                Ok(()) => active_peers.push(peer),
+                Err(error) => {
+                    eprintln!("[bridge] failed to notify MCP client about tool changes: {error}");
+                }
+            }
+        }
+        self.state.lock().await.peers.extend(active_peers);
+    }
+
+    pub async fn reset_runtime_registry(&self) {
+        let changed = {
+            let mut state = self.state.lock().await;
+            let changed = !direct_tools(&state.tools).is_empty();
+            state.tools.clear();
+            state.pending_model_response.take();
+            state.pending_tool_results.clear();
+            state.cua_preload_completed = false;
+            state.runtime_reset = true;
+            changed
+        };
+        self.model_request_ready.notify_waiters();
+        if changed {
+            self.notify_tool_list_changed().await;
+        }
     }
 
     async fn accept_model_request(&self, request: Value) -> Result<oneshot::Receiver<ModelReply>> {
@@ -198,14 +226,22 @@ impl Bridge {
         let search_outputs = extract_tool_search_outputs(&request);
         let advertised_tools = request.get("tools").and_then(Value::as_array).cloned();
         let (reply_tx, reply_rx) = oneshot::channel();
+        let mut reply_tx = Some(reply_tx);
         let mut resolved = Vec::new();
+        let registry_changed;
+        let mut automatic_reply = None;
 
         {
             let mut state = self.state.lock().await;
             if state.pending_model_response.is_some() {
                 anyhow::bail!("Codex sent a second model request while one is still pending");
             }
+            state.runtime_reset = false;
 
+            let previous_tools = direct_tools(&state.tools)
+                .into_iter()
+                .map(|tool| tool.definition)
+                .collect::<Vec<_>>();
             if let Some(tools) = advertised_tools {
                 state.tools = tools;
             }
@@ -216,51 +252,82 @@ impl Bridge {
                 }
             }
 
-            for (call_id, output, discovered_tools) in search_outputs {
-                if let Some(sender) = state.pending_tool_results.remove(&call_id) {
-                    resolved.push((sender, output));
-                }
+            for discovered_tools in search_outputs {
                 merge_discovered_tools(&mut state.tools, discovered_tools);
             }
 
-            state.pending_model_response = Some(reply_tx);
+            let current_tools = direct_tools(&state.tools)
+                .into_iter()
+                .map(|tool| tool.definition)
+                .collect::<Vec<_>>();
+            registry_changed = previous_tools != current_tools;
+
+            if self.preload_cua_tools && !state.cua_preload_completed {
+                state.cua_preload_completed = true;
+                if state
+                    .tools
+                    .iter()
+                    .any(|tool| tool.get("type").and_then(Value::as_str) == Some("tool_search"))
+                {
+                    automatic_reply = Some(ModelReply::ToolSearch {
+                        call_id: format!(
+                            "fkn-preload-{}",
+                            self.sequence.fetch_add(1, Ordering::Relaxed)
+                        ),
+                        query: "computer use cua repl browser chrome native apps".to_string(),
+                        limit: 16,
+                    });
+                } else {
+                    state.pending_model_response = reply_tx.take();
+                }
+            } else {
+                state.pending_model_response = reply_tx.take();
+            }
         }
 
         for (sender, output) in resolved {
             let _ = sender.send(output);
         }
-        self.model_request_ready.notify_waiters();
+        if let Some(reply) = automatic_reply {
+            reply_tx
+                .take()
+                .expect("automatic preload retains the response sender")
+                .send(reply)
+                .map_err(|_| anyhow::anyhow!("failed to schedule optional Codex tool preload"))?;
+        } else {
+            self.model_request_ready.notify_waiters();
+        }
+        if registry_changed {
+            self.notify_tool_list_changed().await;
+        }
 
         Ok(reply_rx)
     }
 
-    async fn take_model_response_sender(&self) -> oneshot::Sender<ModelReply> {
+    async fn take_model_response_sender(&self) -> Result<oneshot::Sender<ModelReply>> {
         loop {
             let notified = self.model_request_ready.notified();
-            if let Some(sender) = self.state.lock().await.pending_model_response.take() {
-                return sender;
+            let mut state = self.state.lock().await;
+            if state.runtime_reset {
+                anyhow::bail!("Codex runtime reset before a model request was available");
             }
+            if let Some(sender) = state.pending_model_response.take() {
+                return Ok(sender);
+            }
+            drop(state);
             notified.await;
         }
     }
 
-    pub async fn call_tool(
-        &self,
-        call_type: &str,
-        namespace: Option<String>,
-        name: String,
-        payload: Value,
-    ) -> Result<Value> {
-        let call_type = ToolCallType::parse(call_type)
-            .with_context(|| format!("unsupported Codex tool call type: {call_type}"))?;
-
+    async fn call_tool(&self, tool: DirectTool, payload: Value) -> Result<Value> {
         {
             let state = self.state.lock().await;
-            if !registry_contains_tool(&state.tools, call_type, namespace.as_deref(), &name) {
-                anyhow::bail!(
-                    "tool is not present in the active Codex registry: type={call_type:?} namespace={namespace:?} name={name}"
-                );
-            }
+            let current = find_direct_tool(&state.tools, tool.definition.name.as_ref())
+                .context("tool is no longer present in the active Codex registry")?;
+            anyhow::ensure!(
+                current.same_target(&tool),
+                "tool changed in the active Codex registry; refresh the MCP tool list"
+            );
         }
 
         let call_id = format!("fkn-call-{}", self.sequence.fetch_add(1, Ordering::Relaxed));
@@ -271,13 +338,13 @@ impl Bridge {
             .pending_tool_results
             .insert(call_id.clone(), result_tx);
 
-        let model_sender = self.take_model_response_sender().await;
+        let model_sender = self.take_model_response_sender().await?;
         if model_sender
             .send(ModelReply::ToolCall {
                 call_id: call_id.clone(),
-                call_type,
-                namespace,
-                name,
+                call_type: tool.call_type,
+                namespace: tool.namespace,
+                name: tool.native_name,
                 payload,
             })
             .is_err()
@@ -293,58 +360,6 @@ impl Bridge {
         result_rx
             .await
             .context("Codex turn ended before returning the tool result")
-    }
-
-    pub async fn search_tools(&self, query: String, limit: Option<u64>) -> Result<Value> {
-        let has_tool_search = self
-            .state
-            .lock()
-            .await
-            .tools
-            .iter()
-            .any(|tool| tool.get("type").and_then(Value::as_str) == Some("tool_search"));
-        if !has_tool_search {
-            anyhow::bail!("active Codex turn did not advertise tool_search");
-        }
-
-        let call_id = format!(
-            "fkn-search-{}",
-            self.sequence.fetch_add(1, Ordering::Relaxed)
-        );
-        let (result_tx, result_rx) = oneshot::channel();
-        self.state
-            .lock()
-            .await
-            .pending_tool_results
-            .insert(call_id.clone(), result_tx);
-
-        let model_sender = self.take_model_response_sender().await;
-        if model_sender
-            .send(ModelReply::ToolSearch {
-                call_id: call_id.clone(),
-                query,
-                limit,
-            })
-            .is_err()
-        {
-            self.state
-                .lock()
-                .await
-                .pending_tool_results
-                .remove(&call_id);
-            anyhow::bail!("active Codex model request closed before tool_search was delivered");
-        }
-
-        result_rx
-            .await
-            .context("Codex turn ended before returning tool_search output")
-    }
-
-    pub async fn finish(&self, message: String) -> Result<()> {
-        let sender = self.take_model_response_sender().await;
-        sender
-            .send(ModelReply::Finish { message })
-            .map_err(|_| anyhow::anyhow!("active Codex model request closed before finish"))
     }
 }
 
@@ -461,24 +476,14 @@ fn extract_tool_outputs(request: &Value) -> Vec<(String, Value)> {
         .collect()
 }
 
-fn extract_tool_search_outputs(request: &Value) -> Vec<(String, Value, Vec<Value>)> {
+fn extract_tool_search_outputs(request: &Value) -> Vec<Vec<Value>> {
     request
         .get("input")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|item| {
-            if item.get("type").and_then(Value::as_str) != Some("tool_search_output") {
-                return None;
-            }
-            let call_id = item.get("call_id")?.as_str()?.to_string();
-            let tools = item
-                .get("tools")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            Some((call_id, item.clone(), tools))
-        })
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("tool_search_output"))
+        .filter_map(|item| item.get("tools").and_then(Value::as_array).cloned())
         .collect()
 }
 
@@ -500,7 +505,7 @@ fn merge_discovered_tools(registry: &mut Vec<Value>, discovered: Vec<Value>) {
 
 fn codex_output_to_call_tool_result(output: Value) -> CallToolResult {
     let mut content = Vec::new();
-    collect_mcp_content(&output, &mut content);
+    let image_count = collect_mcp_content(&output, &mut content);
     if content.is_empty() {
         content.push(ContentBlock::text(match &output {
             Value::String(text) => text.clone(),
@@ -509,34 +514,47 @@ fn codex_output_to_call_tool_result(output: Value) -> CallToolResult {
     }
 
     let mut result = CallToolResult::success(content);
-    result.structured_content = Some(json!({"output": output}));
+    result.structured_content = Some(if image_count == 0 {
+        json!({"output": output})
+    } else {
+        json!({"content_count":result.content.len(),"image_count":image_count})
+    });
     result
 }
 
-fn collect_mcp_content(value: &Value, content: &mut Vec<ContentBlock>) {
+fn tool_execution_error(error: impl std::fmt::Display) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(error.to_string())])
+}
+
+fn collect_mcp_content(value: &Value, content: &mut Vec<ContentBlock>) -> usize {
     match value {
-        Value::String(text) => content.push(ContentBlock::text(text.clone())),
-        Value::Array(items) => {
-            for item in items {
-                collect_mcp_content(item, content);
-            }
+        Value::String(text) => {
+            content.push(ContentBlock::text(text.clone()));
+            0
         }
+        Value::Array(items) => items
+            .iter()
+            .map(|item| collect_mcp_content(item, content))
+            .sum(),
         Value::Object(object) => match object.get("type").and_then(Value::as_str) {
             Some("input_text" | "output_text" | "text") => {
                 if let Some(text) = object.get("text").and_then(Value::as_str) {
                     content.push(ContentBlock::text(text.to_string()));
                 }
+                0
             }
             Some("input_image" | "image") => {
                 if let Some(image_url) = object.get("image_url").and_then(Value::as_str)
                     && let Some((mime_type, data)) = parse_base64_data_url(image_url)
                 {
                     content.push(ContentBlock::image(data, mime_type));
+                    return 1;
                 }
+                0
             }
-            _ => {}
+            _ => 0,
         },
-        _ => {}
+        _ => 0,
     }
 }
 
@@ -548,63 +566,6 @@ fn parse_base64_data_url(url: &str) -> Option<(String, String)> {
         return None;
     }
     Some((mime_type.to_string(), data.to_string()))
-}
-
-fn registry_contains_tool(
-    tools: &[Value],
-    call_type: ToolCallType,
-    namespace: Option<&str>,
-    name: &str,
-) -> bool {
-    tools.iter().any(|tool| {
-        if registry_entry_matches(tool, call_type, namespace, name) {
-            return true;
-        }
-
-        let parent_namespace = tool
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|_| tool.get("type").and_then(Value::as_str) == Some("namespace"));
-        if namespace.is_some() && parent_namespace != namespace {
-            return false;
-        }
-
-        tool.get("tools")
-            .and_then(Value::as_array)
-            .is_some_and(|nested| {
-                nested
-                    .iter()
-                    .any(|tool| registry_entry_matches(tool, call_type, None, name))
-            })
-    })
-}
-
-fn registry_entry_matches(
-    tool: &Value,
-    call_type: ToolCallType,
-    namespace: Option<&str>,
-    name: &str,
-) -> bool {
-    let expected_type = match call_type {
-        ToolCallType::Function => "function",
-        ToolCallType::Custom => "custom",
-    };
-    let type_matches = tool.get("type").and_then(Value::as_str) == Some(expected_type);
-    let name_matches = tool.get("name").and_then(Value::as_str) == Some(name)
-        || tool
-            .get("function")
-            .and_then(|function| function.get("name"))
-            .and_then(Value::as_str)
-            == Some(name);
-    let namespace_matches = match namespace {
-        Some(namespace) => {
-            tool.get("namespace").and_then(Value::as_str) == Some(namespace)
-                || tool.get("server_label").and_then(Value::as_str) == Some(namespace)
-        }
-        None => true,
-    };
-
-    type_matches && name_matches && namespace_matches
 }
 
 async fn responses_handler(
@@ -647,13 +608,13 @@ fn sse_response(response_id: String, reply: ModelReply) -> Response {
             payload,
         } => {
             let mut item = match call_type {
-                ToolCallType::Function => json!({
+                NativeToolCallType::Function => json!({
                     "type": "function_call",
                     "call_id": call_id,
                     "name": name,
                     "arguments": serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()),
                 }),
-                ToolCallType::Custom => json!({
+                NativeToolCallType::Custom => json!({
                     "type": "custom_tool_call",
                     "call_id": call_id,
                     "name": name,
@@ -673,29 +634,14 @@ fn sse_response(response_id: String, reply: ModelReply) -> Response {
             query,
             limit,
         } => {
-            let mut arguments = json!({"query": query});
-            if let Some(limit) = limit {
-                arguments["limit"] = json!(limit);
-            }
             events.push(json!({
                 "type": "response.output_item.done",
                 "item": {
                     "type": "tool_search_call",
                     "call_id": call_id,
                     "execution": "client",
-                    "arguments": arguments,
+                    "arguments": {"query": query, "limit": limit},
                 }
-            }));
-        }
-        ModelReply::Finish { message } => {
-            events.push(json!({
-                "type": "response.output_item.done",
-                "item": {
-                    "type": "message",
-                    "role": "assistant",
-                    "id": format!("{response_id}-message"),
-                    "content": [{"type": "output_text", "text": message}],
-                },
             }));
         }
     }
@@ -754,7 +700,7 @@ impl BridgeMcpHandler {
         tool
     }
 
-    fn tools() -> Vec<Tool> {
+    fn controller_tools() -> Vec<Tool> {
         vec![
             Self::tool(
                 "codex_skills_list",
@@ -788,93 +734,28 @@ impl BridgeMcpHandler {
                 }),
                 true,
             ),
-            Self::tool(
-                "codex_inventory",
-                "Inspect the authoritative native tool registry advertised by the active hidden Codex runtime. Call this before the first codex_exec. Each returned entry preserves Codex's exact tool type, name, description, parameter/format schema, namespace metadata, and other native fields. Use those returned descriptions and schemas to choose and call tools; never invent a tool name or argument shape. Deferred plugin tools may require codex_search_tools before they appear in the callable registry.",
-                json!({"type":"object","properties":{},"additionalProperties":false}),
-                true,
-            ),
-            Self::tool(
-                "codex_search_tools",
-                "Discover deferred Codex tools that are not fully loaded in the initial inventory. Use this when you need a capability whose exact tool is not already visible, especially Browser, Chrome, native Computer Use, or plugin-provided MCP tools. Search by the capability you need. The response preserves Codex's exact namespace/tool descriptions and parameter schemas and also makes the returned tools immediately callable through codex_exec. Read that metadata before executing anything.",
-                json!({
-                    "type":"object",
-                    "properties":{
-                        "query":{
-                            "type":"string",
-                            "minLength":1,
-                            "description":"Semantic capability query, such as 'browser chrome computer use screenshots click type text'. Prefer describing the desired capability rather than guessing an internal tool name."
-                        },
-                        "limit":{
-                            "type":"integer",
-                            "minimum":1,
-                            "maximum":32,
-                            "description":"Maximum number of deferred search matches to request. Omit unless the default search result set is insufficient."
-                        }
-                    },
-                    "required":["query"],
-                    "additionalProperties":false
-                }),
-                true,
-            ),
-            Self::tool(
-                "codex_exec",
-                "Execute exactly one native Codex tool that is already present in codex_inventory or was returned by codex_search_tools. Treat the native metadata as authoritative: copy the exact call type, namespace when present, tool name, and argument shape; do not guess unsupported fields. Use call_type='function' with arguments for JSON-schema function tools. Use call_type='custom' with input for freeform/custom tools such as apply_patch. Tool results, including text and images, are returned to you without asking hidden Codex to reason about the user's task. For Browser/Chrome screenshots, follow the bound tab documentation and emit the browser image with `await nodeRepl.emitImage(await tab.screenshot())`; do not substitute undocumented runtime helpers such as `rt.getScreenshot()` for a browser tab.",
-                json!({
-                    "type":"object",
-                    "properties":{
-                        "call_type":{
-                            "type":"string",
-                            "enum":["function","custom"],
-                            "description":"Exact native call class. Use function for tools with a parameters schema and custom for freeform tools with a format definition."
-                        },
-                        "namespace":{
-                            "type":"string",
-                            "minLength":1,
-                            "description":"Namespace returned by codex_search_tools for a namespaced/deferred tool, for example mcp__cua_repl. Omit for top-level native tools."
-                        },
-                        "name":{
-                            "type":"string",
-                            "minLength":1,
-                            "description":"Exact native tool name from codex_inventory or codex_search_tools, for example exec_command, view_image, js, or apply_patch."
-                        },
-                        "arguments":{
-                            "type":"object",
-                            "additionalProperties":true,
-                            "description":"Arguments for call_type=function. They must conform to the native tool's returned parameters schema."
-                        },
-                        "input":{
-                            "type":"string",
-                            "description":"Raw freeform input for call_type=custom. Do not JSON-wrap custom tool input."
-                        }
-                    },
-                    "required":["call_type","name"],
-                    "additionalProperties":false
-                }),
-                false,
-            ),
-            Self::tool(
-                "codex_finish",
-                "End the active hidden Codex execution turn only after the current controller task no longer needs any Codex tools. This terminates that hidden execution turn, so do not call it between related shell, Browser, Computer Use, or other tool operations that need to keep runtime state alive.",
-                json!({
-                    "type":"object",
-                    "properties":{
-                        "message":{
-                            "type":"string",
-                            "description":"Optional terminal message recorded as the hidden Codex turn's final assistant message. This is runtime bookkeeping, not the user-facing answer."
-                        }
-                    },
-                    "additionalProperties":false
-                }),
-                false,
-            ),
         ]
+    }
+
+    fn tools_for_registry(registry: &[Value]) -> Vec<Tool> {
+        let mut tools = Self::controller_tools();
+        for native in direct_tools(registry) {
+            if tools.iter().all(|tool| tool.name != native.definition.name) {
+                tools.push(native.definition);
+            }
+        }
+        tools
     }
 }
 
 impl ServerHandler for BridgeMcpHandler {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
     }
 
     async fn list_tools(
@@ -882,7 +763,14 @@ impl ServerHandler for BridgeMcpHandler {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(Self::tools()))
+        let registry = self.bridge.state.lock().await.tools.clone();
+        Ok(ListToolsResult::with_all_items(Self::tools_for_registry(
+            &registry,
+        )))
+    }
+
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        self.bridge.register_peer(context.peer).await;
     }
 
     async fn call_tool(
@@ -897,12 +785,10 @@ impl ServerHandler for BridgeMcpHandler {
                     .get("force_reload")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let output = self
-                    .bridge
-                    .skills_list(force_reload)
-                    .await
-                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                Ok(CallToolResult::structured(output).into())
+                match self.bridge.skills_list(force_reload).await {
+                    Ok(output) => Ok(CallToolResult::structured(output).into()),
+                    Err(error) => Ok(tool_execution_error(error).into()),
+                }
             }
             "codex_skill_get" => {
                 let name = args
@@ -910,81 +796,25 @@ impl ServerHandler for BridgeMcpHandler {
                     .and_then(Value::as_str)
                     .filter(|name| !name.trim().is_empty())
                     .ok_or_else(|| McpError::invalid_params("missing name", None))?;
-                let output = self
-                    .bridge
-                    .skill_get(name)
-                    .await
-                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                Ok(CallToolResult::structured(output).into())
+                match self.bridge.skill_get(name).await {
+                    Ok(output) => Ok(CallToolResult::structured(output).into()),
+                    Err(error) => Ok(tool_execution_error(error).into()),
+                }
             }
-            "codex_inventory" => {
-                Ok(CallToolResult::structured(self.bridge.inventory().await).into())
+            name => {
+                let tool = {
+                    let state = self.bridge.state.lock().await;
+                    find_direct_tool(&state.tools, name)
+                }
+                .ok_or_else(|| McpError::invalid_params(format!("unknown tool: {name}"), None))?;
+                let payload = tool
+                    .payload(args)
+                    .map_err(|error| McpError::invalid_params(error, None))?;
+                match self.bridge.call_tool(tool, payload).await {
+                    Ok(output) => Ok(codex_output_to_call_tool_result(output).into()),
+                    Err(error) => Ok(tool_execution_error(error).into()),
+                }
             }
-            "codex_search_tools" => {
-                let query = args
-                    .get("query")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| McpError::invalid_params("missing query", None))?
-                    .to_string();
-                let limit = args.get("limit").and_then(Value::as_u64);
-                let output = self
-                    .bridge
-                    .search_tools(query, limit)
-                    .await
-                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                Ok(CallToolResult::structured(json!({"output": output})).into())
-            }
-            "codex_exec" => {
-                let call_type = args
-                    .get("call_type")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| McpError::invalid_params("missing call_type", None))?;
-                let name = args
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| McpError::invalid_params("missing name", None))?
-                    .to_string();
-                let namespace = args
-                    .get("namespace")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                let payload = match call_type {
-                    "function" => args.get("arguments").cloned().unwrap_or_else(|| json!({})),
-                    "custom" => args
-                        .get("input")
-                        .cloned()
-                        .unwrap_or(Value::String(String::new())),
-                    other => {
-                        return Err(McpError::invalid_params(
-                            format!("unsupported call_type: {other}"),
-                            None,
-                        ));
-                    }
-                };
-
-                let output = self
-                    .bridge
-                    .call_tool(call_type, namespace, name, payload)
-                    .await
-                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                Ok(codex_output_to_call_tool_result(output).into())
-            }
-            "codex_finish" => {
-                let message = args
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("External ChatGPT controller completed the Codex turn.")
-                    .to_string();
-                self.bridge
-                    .finish(message)
-                    .await
-                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                Ok(CallToolResult::structured(json!({"finished": true})).into())
-            }
-            other => Err(McpError::invalid_params(
-                format!("unknown tool: {other}"),
-                None,
-            )),
         }
     }
 }

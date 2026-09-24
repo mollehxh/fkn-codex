@@ -9,11 +9,19 @@ name = "fkn-codex-bridge"
 path = "src/main.rs"
 
 [[bin]]
+name = "fkn-codex-bridge-2"
+path = "src/main.rs"
+
+[[bin]]
 name = "fkn-mcp-smoke"
 path = "src/bin/mcp_smoke.rs"
 
 [[bin]]
 name = "fkn-codex"
+path = "src/bin/fkn-codex/main.rs"
+
+[[bin]]
+name = "fkn-codex-2"
 path = "src/bin/fkn-codex/main.rs"
 
 [[bin]]

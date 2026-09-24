@@ -9,7 +9,7 @@ const repoRoot = resolve(bridgeDir, "..");
 const exe = process.platform === "win32" ? ".exe" : "";
 const bridgeBin = process.env.FKN_CODEX_BRIDGE_BIN ?? join(bridgeDir, "target", "debug", `fkn-codex-bridge${exe}`);
 const codexBin = process.env.FKN_CODEX_BIN ?? join(repoRoot, "codex-rs", "target", "debug", `codex${exe}`);
-const scratch = await mkdtemp(join(tmpdir(), "fkn-lifecycle-smoke-"));
+const scratch = await mkdtemp(join(tmpdir(), "fkn-direct-tools-smoke-"));
 const workspace = join(scratch, "workspace");
 const codexHome = join(scratch, "codex-home");
 const readyFile = join(scratch, "ready.json");
@@ -61,35 +61,23 @@ async function rpc(id, method, params) {
 
 try {
   mcpUrl = (await waitForReadyFile()).mcp_url;
-  await rpc(1, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fkn-lifecycle-smoke", version: "1" } });
-  const first = await rpc(2, "tools/call", { name: "codex_inventory", arguments: {} });
-  if (first.structuredContent?.ready !== true) throw new Error("First Codex turn was not ready");
-  await rpc(3, "tools/call", { name: "codex_finish", arguments: { message: "First turn complete" } });
-
-  let secondReady = false;
-  for (let attempt = 0; attempt < 150; attempt += 1) {
-    if (exited) throw new Error(`Bridge exited after codex_finish:\n${output}`);
-    try {
-      const next = await rpc(4 + attempt, "tools/call", { name: "codex_inventory", arguments: {} });
-      if (next.structuredContent?.ready === true) { secondReady = true; break; }
-    } catch (error) {
-      if (exited) throw error;
-    }
-    await delay(100);
-  }
-  if (!secondReady) throw new Error(`Second Codex turn was not ready:\n${output}`);
-  const command = await rpc(200, "tools/call", {
-    name: "codex_exec",
+  const initialized = await rpc(1, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fkn-direct-tools-smoke", version: "1" } });
+  if (initialized.capabilities?.tools?.listChanged !== true) throw new Error("Bridge did not advertise dynamic tool-list notifications");
+  const first = await rpc(2, "tools/list", {});
+  if (!first.tools?.some((tool) => tool.name === "exec_command")) throw new Error("First Codex turn did not publish exec_command directly");
+  if (first.tools?.some((tool) => tool.name.startsWith("mcp__cua_repl__"))) throw new Error("CUA tools were advertised while CUA was disabled");
+  const command = await rpc(3, "tools/call", {
+    name: "exec_command",
     arguments: {
-      call_type: "function",
-      name: "exec_command",
-      arguments: { cmd: "pwd", yield_time_ms: 10000, max_output_tokens: 1000 },
+      cmd: "pwd",
+      yield_time_ms: 10000,
+      max_output_tokens: 1000,
     },
   });
   if (command.isError || !command.structuredContent?.output?.includes(await realpath(workspace))) {
-    throw new Error(`Second Codex turn could not execute pwd: ${JSON.stringify(command)}`);
+    throw new Error(`Direct exec_command could not execute pwd: ${JSON.stringify(command)}`);
   }
-  console.log("PASS: bridge remains available after codex_finish and executes in a second turn");
+  console.log("PASS: direct tools execute and optional CUA stays hidden when disabled");
 } finally {
   if (!exited) {
     if (process.platform === "win32") child.kill();

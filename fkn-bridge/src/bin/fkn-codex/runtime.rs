@@ -28,13 +28,27 @@ impl Binaries {
             .ok()
             .and_then(|path| path.parent().map(Path::to_path_buf));
         let cwd = std::env::current_dir().ok();
+        let version_two = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.file_stem().map(|name| name == "fkn-codex-2"))
+            .unwrap_or(false);
+        let bridge_name = if version_two {
+            "fkn-codex-bridge-2"
+        } else {
+            "fkn-codex-bridge"
+        };
+        let bridge_env = if version_two {
+            "FKN_CODEX_BRIDGE_2_BIN"
+        } else {
+            "FKN_CODEX_BRIDGE_BIN"
+        };
         Self {
             bridge: resolve_binary(
-                "FKN_CODEX_BRIDGE_BIN",
-                executable_name("fkn-codex-bridge"),
+                bridge_env,
+                executable_name(bridge_name),
                 exe_dir.as_deref(),
                 cwd.as_deref()
-                    .map(|root| root.join("fkn-bridge/target/debug/fkn-codex-bridge")),
+                    .map(|root| root.join(format!("fkn-bridge/target/debug/{bridge_name}"))),
             ),
             codex: resolve_binary(
                 "FKN_CODEX_BIN",
@@ -67,6 +81,8 @@ fn executable_name(base: &str) -> &'static str {
     match base {
         "fkn-codex-bridge" if cfg!(windows) => "fkn-codex-bridge.exe",
         "fkn-codex-bridge" => "fkn-codex-bridge",
+        "fkn-codex-bridge-2" if cfg!(windows) => "fkn-codex-bridge-2.exe",
+        "fkn-codex-bridge-2" => "fkn-codex-bridge-2",
         "codex" if cfg!(windows) => "codex.exe",
         "codex" => "codex",
         "fkn-codex-auth-shim" if cfg!(windows) => "fkn-codex-auth-shim.exe",

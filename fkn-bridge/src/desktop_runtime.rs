@@ -109,7 +109,7 @@ impl DesktopRuntime {
             ),
             ("NODE_REPL_TRUSTED_CODE_PATHS", trusted_paths),
             ("CODEX_HOME", codex_home.to_string_lossy().into_owned()),
-            ("BROWSER_USE_AVAILABLE_BACKENDS", "chrome,iab".to_string()),
+            ("BROWSER_USE_AVAILABLE_BACKENDS", "chrome".to_string()),
             ("BROWSER_USE_TINYSKY_ENABLED", "1".to_string()),
             (
                 "NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER",

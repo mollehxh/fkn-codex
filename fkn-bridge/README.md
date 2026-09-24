@@ -27,14 +27,16 @@ with `pwd`. The second `/v1/responses` request must contain the corresponding
 
 No OpenAI model inference is used by this smoke test.
 
-## `fkn-codex` TUI
+## `fkn-codex` / `fkn-codex-2` TUI
 
-The user-facing entry point is the `fkn-codex` binary. Run it from the project you
-want ChatGPT to control:
+The user-facing entry points are `fkn-codex` and the parallel `fkn-codex-2` binary.
+The original launcher keeps using `fkn-codex-bridge`; the second launcher uses the
+separate `fkn-codex-bridge-2`, so the existing build stays available while the new
+bridge can be launched separately:
 
 ```bash
 cd /path/to/project
-fkn-codex
+fkn-codex-2
 ```
 
 The current directory becomes the Codex workspace. Connection settings are app-wide,
@@ -99,42 +101,36 @@ http://127.0.0.1:8787/v1/responses
 
 It launches the Codex binary from this checkout with a separate `CODEX_HOME`
 and the local Responses endpoint configured as its model provider. The MCP side
-exposes six small controller tools:
+publishes the active Codex registry as ordinary MCP tools:
 
 - `codex_skills_list` — proxies Codex app-server `skills/list` for the configured workspace.
 - `codex_skill_get` — resolves a skill through that native catalog and returns its full `SKILL.md`; arbitrary paths are not accepted.
-- `codex_inventory` — returns the exact tool registry advertised by the active Codex turn.
-- `codex_search_tools` — runs Codex's native deferred tool search and exposes matching tools to `codex_exec`.
-- `codex_exec` — sends any exact function/custom tool call from the active registry into the waiting Codex turn. This is the single execution path for built-ins (`exec_command`, `write_stdin`, `apply_patch`, `view_image`) and deferred MCP namespaces such as `mcp__cua_repl` or `mcp__node_repl`.
-- `codex_finish` — completes the hidden Codex turn.
+- Native top-level tools keep their names, including `exec_command`, `write_stdin`,
+  `apply_patch`, and `view_image`.
+- Namespaced tools use `<namespace>__<tool>`, for example
+  `mcp__cua_repl__js`.
 
-`codex_exec` preserves the exact native Codex result in `structuredContent.output`.
-Codex text/image output items are also projected to native MCP content blocks, so a
-`view_image` result or a screenshot emitted by a deferred tool reaches the MCP client
-as an actual image rather than a JSON-encoded data URL.
+The bridge copies native descriptions and JSON schemas into `tools/list`; the model
+does not need to inspect an inventory or provide call-type and namespace metadata.
+Only tools present in the active hidden Codex registry are advertised. The bridge
+declares `tools.listChanged` and emits the standard notification when a restarted
+runtime publishes a different registry.
 
-`codex_search_tools` merges discovered namespace entries into the active registry by
-identity instead of appending duplicates. There is no Browser- or Computer-Use-specific
-execution endpoint: discovered tools are validated and executed through `codex_exec`.
+Codex text/image output items are projected to native MCP content blocks, so a
+`view_image` result or a CUA screenshot reaches the MCP client as an actual image.
+Image base64 is not copied into `structuredContent`; that field contains only compact
+content counts for image-bearing results.
 
 ### Tool metadata contract
 
-The six controller-facing MCP tools include explicit descriptions of when to use them
-and descriptions for every non-empty argument schema. In particular,
-`codex_inventory` and `codex_search_tools` tell the controller to treat Codex's
-returned metadata as authoritative rather than guessing tool names or arguments.
-
-Native Codex tool entries are preserved as received from the active Responses request,
-including their `description`, `parameters` or custom `format`, namespace data, and
-other native fields. Deferred `tool_search` results are likewise returned unchanged
-and merged into the callable registry without stripping namespace/tool descriptions
-or parameter schemas. `codex_exec` therefore executes against the same metadata the
-controller inspected.
+Native function descriptions and parameter schemas are preserved from the active
+Responses request. Native custom tools are exposed with one `input` string because
+MCP tool calls use JSON objects while Codex custom tools use freeform input.
 
 For Browser/Chrome screenshots, the controller should follow the bound browser-tab
 documentation and use the browser API's native image path, for example
 `await nodeRepl.emitImage(await tab.screenshot())`. Browser screenshots returned by
-`cua_repl` are converted into native MCP image content by `codex_exec`; undocumented
+`cua_repl` are converted into native MCP image content; undocumented
 runtime-specific screenshot helpers are not interchangeable with a bound browser tab.
 
 ## Browser + Computer Use
@@ -152,8 +148,8 @@ Current platform state:
   implemented or claimed to work.
 
 Adding Windows support therefore only requires implementing the Windows branch in
-`DesktopRuntimeLocator`; the Codex plugin bootstrap, MCP API, skills API, and generic
-`codex_exec` path remain unchanged.
+`DesktopRuntimeLocator`; the Codex plugin bootstrap, MCP API, skills API, and direct
+tool projection remain unchanged.
 
 On macOS the bridge bootstraps the unified Computer Use runtime automatically from
 the installed `/Applications/ChatGPT.app`. It does not require Browser-specific
@@ -181,15 +177,15 @@ metadata; the small runtime override supplies the desktop-managed executable pat
 that are intentionally not hard-coded in the plugin manifest itself. The `CODEX_HOME`
 visible to all of it remains the bridge's isolated home.
 
-The external controller flow is therefore only:
+The external controller sees the CUA constructor directly when that runtime loaded:
 
 ```text
-codex_search_tools("computer use browser chrome")
-  -> mcp__cua_repl.js
-
-codex_exec(namespace="mcp__cua_repl", name="js", ...)
+mcp__cua_repl__js(code="...")
   -> browser or native Computer Use action
 ```
+
+The bridge advertises the Chrome backend. It does not advertise the unavailable IAB
+backend to CUA.
 
 Pass `--disable-cua` to run without Browser / Computer Use, or `--chatgpt-app`
 to override Desktop runtime discovery. If ChatGPT Desktop is absent, startup
@@ -202,7 +198,8 @@ Build the forked Codex and bridge:
 cd codex-rs
 cargo build -p codex-cli --bin codex
 cd ../fkn-bridge
-cargo build
+cargo build --bin fkn-codex --bin fkn-codex-bridge
+cargo build --bin fkn-codex-2 --bin fkn-codex-bridge-2
 ```
 
 Start the bridge against a workspace:
@@ -222,5 +219,5 @@ Then, in another terminal, exercise the complete generic MCP path with the local
 
 The generic smoke covers `exec_command`, an interactive `write_stdin` session,
 `apply_patch`, native MCP image propagation from `view_image`, discovery of
-the native Browser/Chrome plugin skills, `mcp__cua_repl.js`, and generic execution
-through that deferred namespace.
+the native Browser/Chrome plugin skills, direct `mcp__cua_repl__js`, and generic
+execution through that namespaced constructor.

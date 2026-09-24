@@ -119,6 +119,11 @@ async fn main() -> Result<()> {
         args.codex_bin.clone(),
         args.codex_home.clone(),
     );
+    let bridge = if desktop_runtime.is_some() {
+        bridge.with_cua_tools()
+    } else {
+        bridge
+    };
     let router = build_router(bridge.clone());
 
     println!("FKN Codex bridge");
@@ -224,6 +229,7 @@ async fn main() -> Result<()> {
         tokio::select! {
             status = child.wait() => {
                 let status = status.context("wait for bundled Codex")?;
+                bridge.reset_runtime_registry().await;
                 if !status.success() {
                     anyhow::bail!("bundled Codex exited with {status}");
                 }
