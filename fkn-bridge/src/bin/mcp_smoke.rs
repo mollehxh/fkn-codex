@@ -37,9 +37,33 @@ async fn main() -> Result<()> {
         "apply_patch",
         "view_image",
         "mcp__cua_repl__js",
+        "mcp__cua_repl__js_reset",
+        "mcp__cua_repl__js_add_node_module_dir",
     ] {
         anyhow::ensure!(names.contains(&expected), "missing MCP tool {expected}");
     }
+    for forbidden in [
+        "codex_tools_search",
+        "codex_tool_call",
+        "request_user_input",
+        "list_mcp_resources",
+        "list_mcp_resource_templates",
+        "read_mcp_resource",
+        "get_goal",
+        "create_goal",
+        "update_goal",
+    ] {
+        anyhow::ensure!(
+            !names.contains(&forbidden),
+            "forbidden MCP tool was advertised: {forbidden}"
+        );
+    }
+    anyhow::ensure!(
+        !names
+            .iter()
+            .any(|name| name.starts_with("multi_agent_v1__")),
+        "multi-agent MCP tools were advertised"
+    );
     let skills = client
         .call_tool(
             CallToolRequestParams::new("codex_skills_list").with_arguments(
@@ -51,18 +75,17 @@ async fn main() -> Result<()> {
         .structured_content
         .context("codex_skills_list returned no structured content")?;
     let discovered_skills = skills
-        .get("data")
+        .get("skills")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .flat_map(|entry| {
-            entry
-                .get("skills")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-        })
         .collect::<Vec<_>>();
+    anyhow::ensure!(
+        discovered_skills
+            .iter()
+            .all(|skill| skill.get("path").is_none() && skill.get("enabled").is_none()),
+        "compact skills catalog leaked internal path or enabled-state noise"
+    );
     for (name, plugin_id) in [
         ("browser:control-in-app-browser", "browser@openai-bundled"),
         ("chrome:control-chrome", "chrome@openai-bundled"),
@@ -70,7 +93,7 @@ async fn main() -> Result<()> {
         anyhow::ensure!(
             discovered_skills.iter().any(|skill| {
                 skill.get("name").and_then(Value::as_str) == Some(name)
-                    && skill.get("pluginId").and_then(Value::as_str) == Some(plugin_id)
+                    && skill.get("plugin_id").and_then(Value::as_str) == Some(plugin_id)
             }),
             "native plugin skill missing: {name} ({plugin_id})"
         );
@@ -375,11 +398,12 @@ async fn exec_text(
 ) -> Result<String> {
     let result = exec(client, name, arguments).await?;
     result
-        .structured_content
-        .as_ref()
-        .and_then(|value| value.get("output"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
+        .content
+        .iter()
+        .find_map(|content| match content {
+            ContentBlock::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
         .with_context(|| format!("{name} output was not text"))
 }
 

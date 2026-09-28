@@ -23,28 +23,9 @@ impl CodexAccessMode {
     }
 }
 
-pub(crate) enum ComputerUseStatus {
-    Enabled,
-    Disabled,
-}
-
-impl ComputerUseStatus {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Enabled => "enabled",
-            Self::Disabled => "disabled",
-        }
-    }
-}
-
-pub(crate) fn render(
-    workspace: &Path,
-    access_mode: CodexAccessMode,
-    computer_use: ComputerUseStatus,
-) -> Option<String> {
+pub(crate) fn render(workspace: &Path, access_mode: CodexAccessMode) -> Option<String> {
     let workspace =
         bounded_context_field(&workspace.to_string_lossy(), MAX_WORKSPACE_CONTEXT_BYTES);
-    let workspace = serde_json::to_string(&workspace).ok()?;
     let shell = if cfg!(windows) {
         "powershell".to_string()
     } else {
@@ -55,13 +36,20 @@ pub(crate) fn render(
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "sh".to_string())
     };
-    let computer_use = computer_use.as_str();
-    let shell =
-        serde_json::to_string(&bounded_context_field(&shell, MAX_SHELL_CONTEXT_BYTES)).ok()?;
+    let shell = bounded_context_field(&shell, MAX_SHELL_CONTEXT_BYTES);
+    let os = match std::env::consts::OS {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        other => other,
+    };
     let instructions = format!(
-        "Local Codex controller. Tools run on the user's local machine. Environment: os={}/{}; shell={shell}; access={}; computer_use={computer_use}; cwd={workspace}. Treat cwd as the default workspace and use absolute paths when operating elsewhere.",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
+        "At the start of each conversation, call `codex_skills_list` once to get the skill list. Call it again only if the available skills may have changed. If Browser Use, Computer Use, or any CUA tool returns `tool_unavailable`, do not perform the same action via shell, scripts, direct HTTP, browser automation, or another workaround unless the user explicitly asks. Report the unavailable tool and `requiredAction`, if provided. Environment: {os}/{arch}, {shell}, {}, cwd={workspace}.",
         access_mode.as_str(),
     );
     Some(truncate_utf8(instructions, MAX_SERVER_INSTRUCTIONS_BYTES))
@@ -71,7 +59,7 @@ fn bounded_context_field(value: &str, max_bytes: usize) -> String {
     truncate_utf8(value.to_string(), max_bytes)
 }
 
-fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
+pub(crate) fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value;
     }

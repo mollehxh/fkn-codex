@@ -101,31 +101,42 @@ http://127.0.0.1:8787/v1/responses
 
 It launches the Codex binary from this checkout with a separate `CODEX_HOME`
 and the local Responses endpoint configured as its model provider. The MCP side
-publishes the active Codex registry as ordinary MCP tools:
+publishes a stable set of Codex tools:
 
 - `codex_skills_list` — proxies Codex app-server `skills/list` for the configured workspace.
 - `codex_skill_get` — resolves a skill through that native catalog and returns its full `SKILL.md`; arbitrary paths are not accepted.
-- Native top-level tools keep their names, including `exec_command`, `write_stdin`,
-  `apply_patch`, and `view_image`.
-- Namespaced tools use `<namespace>__<tool>`, for example
-  `mcp__cua_repl__js`.
+- Native tools: `exec_command`, `write_stdin`, `apply_patch`, and `view_image`.
+- Computer Use tools: `mcp__cua_repl__js`, `mcp__cua_repl__js_reset`, and
+  `mcp__cua_repl__js_add_node_module_dir`.
 
 The bridge copies native descriptions and JSON schemas into `tools/list`; the model
 does not need to inspect an inventory or provide call-type and namespace metadata.
-Only tools present in the active hidden Codex registry are advertised. The bridge
-declares `tools.listChanged` and emits the standard notification when a restarted
-runtime publishes a different registry.
+The public list is stable and never depends on optional registry discovery or a
+manual refresh in ChatGPT. Computer Use tools remain visible when the desktop runtime is
+temporarily unavailable; calling one returns a structured `tool_unavailable` error
+with a recovery action.
 
-Codex text/image output items are projected to native MCP content blocks, so a
+The MCP server instructions tell the controller to call `codex_skills_list` once at
+the start of each conversation so it can review the available skills. The controller
+decides whether any skill is relevant, reads only relevant skills with
+`codex_skill_get`, and can continue without one. The returned catalog contains only
+enabled skills, preserves full descriptions, and omits local paths. The catalog is
+not repeated unless skills or plugins may have changed.
+
+Codex text/image output items are projected once to native MCP content blocks, so a
 `view_image` result or a CUA screenshot reaches the MCP client as an actual image.
-Image base64 is not copied into `structuredContent`; that field contains only compact
-content counts for image-bearing results.
+Plain text and native content blocks are not duplicated in `structuredContent`.
+Unprojectable JSON remains available as structured MCP content instead of being
+silently discarded.
 
 ### Tool metadata contract
 
 Native function descriptions and parameter schemas are preserved from the active
 Responses request. Native custom tools are exposed with one `input` string because
-MCP tool calls use JSON objects while Codex custom tools use freeform input.
+MCP tool calls use JSON objects while Codex custom tools use freeform input. The
+Computer Use fallback definitions use the original macOS CUA descriptions and
+schemas so those tools remain callable by the same names even when their runtime
+is not currently connected.
 
 For Browser/Chrome screenshots, the controller should follow the bound browser-tab
 documentation and use the browser API's native image path, for example
