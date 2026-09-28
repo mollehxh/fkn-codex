@@ -63,22 +63,56 @@ async function rpc(id, method, params) {
 try {
   mcpUrl = (await waitForReadyFile()).mcp_url;
   const initialized = await rpc(1, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fkn-direct-tools-smoke", version: "1" } });
-  if (initialized.capabilities?.tools?.listChanged !== true) throw new Error("Bridge did not advertise dynamic tool-list notifications");
-  const cwdStart = initialized.instructions?.indexOf("; cwd=") ?? -1;
-  const cwdEnd = initialized.instructions?.indexOf(". Treat cwd", cwdStart) ?? -1;
-  if (cwdStart < 0 || cwdEnd < 0) throw new Error(`MCP server instructions did not include the local workspace: ${initialized.instructions}`);
-  const advertisedWorkspace = JSON.parse(initialized.instructions.slice(cwdStart + 6, cwdEnd));
+  if (initialized.capabilities?.tools?.listChanged === true) throw new Error("Bridge advertised dynamic tool-list notifications");
+  const cwdStart = initialized.instructions?.indexOf("cwd=") ?? -1;
+  if (cwdStart < 0) throw new Error(`MCP server instructions did not include the local workspace: ${initialized.instructions}`);
+  const advertisedWorkspace = initialized.instructions.slice(cwdStart + 4).replace(/\.$/, "");
   const normalizeWindowsPath = (value) => process.platform === "win32" ? value.replace(/^\\\\\?\\/, "").toLowerCase() : value;
   if (normalizeWindowsPath(advertisedWorkspace) !== normalizeWindowsPath(await realpath(workspace))) throw new Error(`MCP server instructions advertised the wrong workspace: ${initialized.instructions}`);
-  if (!initialized.instructions?.includes("access=danger-full-access")) throw new Error(`MCP server instructions did not include the access mode: ${initialized.instructions}`);
+  if (!initialized.instructions?.includes("danger-full-access")) throw new Error(`MCP server instructions did not include the access mode: ${initialized.instructions}`);
   if (Buffer.byteLength(initialized.instructions, "utf8") > 1024) throw new Error("MCP server instructions exceeded the bounded context size");
   const first = await rpc(2, "tools/list", {});
   const skillsList = first.tools?.find((tool) => tool.name === "codex_skills_list");
   if (!skillsList?.description?.includes("MCP server instructions (mirrored")) throw new Error("MCP server context was not mirrored into ChatGPT-visible tool metadata");
-  if (!skillsList.description.includes("access=danger-full-access")) throw new Error("Mirrored MCP server context omitted the access mode");
-  if (!first.tools?.some((tool) => tool.name === "exec_command")) throw new Error("First Codex turn did not publish exec_command directly");
-  if (first.tools?.some((tool) => tool.name.startsWith("mcp__cua_repl__"))) throw new Error("CUA tools were advertised while CUA was disabled");
-  const command = await rpc(3, "tools/call", {
+  if (!skillsList.description.includes("danger-full-access")) throw new Error("Mirrored MCP server context omitted the access mode");
+  const expectedTools = new Set([
+    "codex_skills_list",
+    "codex_skill_get",
+    "exec_command",
+    "write_stdin",
+    "apply_patch",
+    "view_image",
+    "mcp__cua_repl__js",
+    "mcp__cua_repl__js_reset",
+    "mcp__cua_repl__js_add_node_module_dir",
+  ]);
+  const actualTools = new Set(first.tools?.map((tool) => tool.name) ?? []);
+  if (actualTools.size !== expectedTools.size || [...expectedTools].some((name) => !actualTools.has(name))) {
+    throw new Error(`Stable MCP tool list mismatch: ${JSON.stringify([...actualTools])}`);
+  }
+  for (const forbidden of [
+    "codex_tools_search",
+    "codex_tool_call",
+    "request_user_input",
+    "list_mcp_resources",
+    "list_mcp_resource_templates",
+    "read_mcp_resource",
+    "get_goal",
+    "create_goal",
+    "update_goal",
+  ]) {
+    if (actualTools.has(forbidden) || [...actualTools].some((name) => name.startsWith("multi_agent_v1__"))) {
+      throw new Error(`Forbidden MCP tool was advertised: ${forbidden}`);
+    }
+  }
+  const unavailableCua = await rpc(3, "tools/call", {
+    name: "mcp__cua_repl__js",
+    arguments: { code: "nodeRepl.write('should not run')" },
+  });
+  if (!unavailableCua.isError || !JSON.stringify(unavailableCua).includes("tool_unavailable")) {
+    throw new Error(`Disabled CUA did not return tool_unavailable: ${JSON.stringify(unavailableCua)}`);
+  }
+  const command = await rpc(4, "tools/call", {
     name: "exec_command",
     arguments: {
       cmd: "pwd",
@@ -86,10 +120,11 @@ try {
       max_output_tokens: 1000,
     },
   });
-  if (command.isError || !command.structuredContent?.output?.includes(await realpath(workspace))) {
+  const commandText = command.content?.filter((item) => item.type === "text").map((item) => item.text).join("\n") ?? "";
+  if (command.isError || !commandText.includes(await realpath(workspace))) {
     throw new Error(`Direct exec_command could not execute pwd: ${JSON.stringify(command)}`);
   }
-  console.log("PASS: direct tools execute and optional CUA stays hidden when disabled");
+  console.log("PASS: stable direct tools execute and unavailable CUA is explicit");
 } finally {
   if (!exited) {
     if (process.platform === "win32") {

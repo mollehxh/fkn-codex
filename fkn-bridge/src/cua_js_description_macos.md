@@ -1,0 +1,66 @@
+Control native apps or browsers on the user’s computer by reading or operating UI. Prefer purpose-built skills, connectors, APIs, or CLIs when available.
+
+On your first call, or after a reset, execute exactly one of the API calls shown below, optionally assigning its result to a variable. Do not add other API calls, waits, or snapshots to that invocation.
+The tool result will include documentation and, when creating or selecting a tab or selecting an app, its initial UI state. Selecting a browser does not open a tab. Read that result before continuing.
+When this tool is called through a wrapper such as Code Mode, the returned value may be projected by that runtime. Do not assume it is the raw MCP `content[]` envelope; inspect or forward the returned value as-is before accessing wrapper-specific fields.
+Use only APIs described in the tool instructions or returned documentation.
+
+When you need an inventory of available apps, browsers, and tabs, get a snapshot of all enabled surfaces. Otherwise, use the relevant entry point below:
+
+```javascript
+await cua.getState();
+```
+
+Use the first matching browser control option from the user's request:
+
+For a tab @-mention (`mention=tab-v1`):
+Pass the complete `plugin://...` URL to get the referenced tab.
+
+```javascript
+let tab = await cua.getTab({ mention: tabMentionUrl });
+```
+
+For an existing tab identified by URL in browser context (including the current IAB tab):
+
+```javascript
+let tab = await cua.getTab({ url }, { browser: browserId });
+```
+
+Known tab ID (`tabId` or `providerTabId`) and browser (name or browser @-mention):
+
+```javascript
+let tab = await cua.getTab(tabId, { browser: browserId });
+```
+
+To open a URL in the in-app browser (`@Browser`):
+
+```javascript
+let tab = await cua.createBrowserTab("iab", url, { visible: boolean });
+```
+
+To open a URL in another named browser: pass its name directly; do not call `getBrowser` first.
+
+```javascript
+let tab = await cua.createBrowserTab(browserName, url, browserOptions);
+```
+
+Known URL, only when the user has not specified a browser by name or @-mention:
+
+```javascript
+let browser = await cua.getBrowser({ url });
+```
+
+Browser IDs and options:
+
+- `"iab"` (in-app browser): in `createBrowserTab`, use `visible: true` to show the browser; `false` to keep it hidden.
+- `"chrome"` (@Chrome), `"edge"` (@Edge): pass a short, emoji-prefixed `sessionName` (e.g. `"🔎 Task"`) to `createBrowserTab` when starting a task.
+
+If the user specifies an app to use, get the app by name, bundle ID, or path:
+
+```javascript
+let app = await cua.getApp("Example App");
+```
+
+To add other content to the tool result, use `nodeRepl.write(value)` for text or other values and `await nodeRepl.emitImage(image)` for images. The APIs listed above already display their documentation or UI state; do not wrap their results in `write` or `emitImage`.
+
+If your context begins with a summary of an existing computer use task, call `await cua.rewriteDocumentation()` before continuing the computer use task to ensure you have a complete view of the necessary documentation.

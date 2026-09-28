@@ -1,4 +1,6 @@
+mod result_projection;
 mod server_context;
+mod skill_catalog;
 mod tool_registry;
 
 use anyhow::Context as _;
@@ -13,12 +15,12 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::post;
+use result_projection::codex_output_to_call_tool_result;
+use result_projection::tool_execution_error;
 use rmcp::ErrorData as McpError;
-use rmcp::Peer;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::CallToolResult;
-use rmcp::model::ContentBlock;
 use rmcp::model::JsonObject;
 use rmcp::model::ListToolsResult;
 use rmcp::model::PaginatedRequestParams;
@@ -26,7 +28,6 @@ use rmcp::model::ServerCapabilities;
 use rmcp::model::ServerInfo;
 use rmcp::model::Tool;
 use rmcp::model::ToolAnnotations;
-use rmcp::service::NotificationContext;
 use rmcp::service::RequestContext;
 use rmcp::service::RoleServer;
 use rmcp::transport::StreamableHttpServerConfig;
@@ -35,6 +36,8 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use serde_json::Value;
 use serde_json::json;
 pub use server_context::CodexAccessMode;
+use skill_catalog::compact_skill_metadata;
+use skill_catalog::compact_skills_catalog;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -52,8 +55,9 @@ use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tool_registry::DirectTool;
 use tool_registry::NativeToolCallType;
-use tool_registry::direct_tools;
+use tool_registry::exposed_native_tools;
 use tool_registry::find_direct_tool;
+use tool_registry::is_cua_tool;
 
 #[derive(Debug)]
 enum ModelReply {
@@ -64,7 +68,7 @@ enum ModelReply {
         name: String,
         payload: Value,
     },
-    ToolSearch {
+    CuaPreload {
         call_id: String,
         query: String,
         limit: u64,
@@ -74,7 +78,7 @@ enum ModelReply {
 #[derive(Default)]
 struct BridgeState {
     tools: Vec<Value>,
-    peers: Vec<Peer<RoleServer>>,
+    skills_catalog: Option<Value>,
     cua_preload_completed: bool,
     runtime_reset: bool,
     pending_model_response: Option<oneshot::Sender<ModelReply>>,
@@ -135,24 +139,16 @@ impl Bridge {
 
     fn server_instructions(&self) -> Option<String> {
         let runtime = self.runtime.as_deref()?;
-        let computer_use = if self.preload_cua_tools {
-            server_context::ComputerUseStatus::Enabled
-        } else {
-            server_context::ComputerUseStatus::Disabled
-        };
-        server_context::render(&runtime.workspace, runtime.access_mode, computer_use)
+        server_context::render(&runtime.workspace, runtime.access_mode)
     }
 
     pub async fn skills_list(&self, force_reload: bool) -> Result<Value> {
-        let runtime = self
-            .runtime
-            .as_deref()
-            .context("Codex runtime metadata is unavailable")?;
-        native_skills_list(runtime, force_reload).await
+        let catalog = self.skills_catalog(force_reload).await?;
+        Ok(compact_skills_catalog(&catalog))
     }
 
     pub async fn skill_get(&self, name: &str) -> Result<Value> {
-        let catalog = self.skills_list(false).await?;
+        let catalog = self.skills_catalog(false).await?;
         let mut matches = Vec::new();
         for entry in catalog
             .get("data")
@@ -195,59 +191,47 @@ impl Bridge {
             std::fs::read_to_string(path).with_context(|| format!("read Codex skill at {path}"))?;
 
         Ok(json!({
-            "skill": skill,
+            "skill": compact_skill_metadata(&skill).context("invalid Codex skill metadata")?,
             "content": content,
         }))
     }
+
+    async fn skills_catalog(&self, force_reload: bool) -> Result<Value> {
+        if !force_reload && let Some(catalog) = self.state.lock().await.skills_catalog.clone() {
+            return Ok(catalog);
+        }
+
+        let runtime = self
+            .runtime
+            .as_deref()
+            .context("Codex runtime metadata is unavailable")?;
+        let catalog = native_skills_list(runtime, force_reload).await?;
+        self.state.lock().await.skills_catalog = Some(catalog.clone());
+        Ok(catalog)
+    }
+
     pub async fn is_ready(&self) -> bool {
         self.state.lock().await.pending_model_response.is_some()
     }
 
-    async fn register_peer(&self, peer: Peer<RoleServer>) {
-        let mut state = self.state.lock().await;
-        state.peers.retain(|peer| !peer.is_transport_closed());
-        state.peers.push(peer);
-    }
-
-    async fn notify_tool_list_changed(&self) {
-        let peers = std::mem::take(&mut self.state.lock().await.peers);
-        let mut active_peers = Vec::new();
-        for peer in peers.into_iter().filter(|peer| !peer.is_transport_closed()) {
-            match peer.notify_tool_list_changed().await {
-                Ok(()) => active_peers.push(peer),
-                Err(error) => {
-                    eprintln!("[bridge] failed to notify MCP client about tool changes: {error}");
-                }
-            }
-        }
-        self.state.lock().await.peers.extend(active_peers);
-    }
-
     pub async fn reset_runtime_registry(&self) {
-        let changed = {
+        {
             let mut state = self.state.lock().await;
-            let changed = !direct_tools(&state.tools).is_empty();
-            state.tools.clear();
             state.pending_model_response.take();
             state.pending_tool_results.clear();
             state.cua_preload_completed = false;
             state.runtime_reset = true;
-            changed
-        };
-        self.model_request_ready.notify_waiters();
-        if changed {
-            self.notify_tool_list_changed().await;
         }
+        self.model_request_ready.notify_waiters();
     }
 
     async fn accept_model_request(&self, request: Value) -> Result<oneshot::Receiver<ModelReply>> {
         let outputs = extract_tool_outputs(&request);
-        let search_outputs = extract_tool_search_outputs(&request);
+        let preload_outputs = extract_cua_preload_outputs(&request);
         let advertised_tools = request.get("tools").and_then(Value::as_array).cloned();
         let (reply_tx, reply_rx) = oneshot::channel();
         let mut reply_tx = Some(reply_tx);
         let mut resolved = Vec::new();
-        let registry_changed;
         let mut automatic_reply = None;
 
         {
@@ -257,10 +241,6 @@ impl Bridge {
             }
             state.runtime_reset = false;
 
-            let previous_tools = direct_tools(&state.tools)
-                .into_iter()
-                .map(|tool| tool.definition)
-                .collect::<Vec<_>>();
             if let Some(tools) = advertised_tools {
                 state.tools = tools;
             }
@@ -271,15 +251,9 @@ impl Bridge {
                 }
             }
 
-            for discovered_tools in search_outputs {
-                merge_discovered_tools(&mut state.tools, discovered_tools);
+            for preloaded_tools in preload_outputs {
+                merge_cua_preload_tools(&mut state.tools, preloaded_tools);
             }
-
-            let current_tools = direct_tools(&state.tools)
-                .into_iter()
-                .map(|tool| tool.definition)
-                .collect::<Vec<_>>();
-            registry_changed = previous_tools != current_tools;
 
             if self.preload_cua_tools && !state.cua_preload_completed {
                 state.cua_preload_completed = true;
@@ -288,7 +262,7 @@ impl Bridge {
                     .iter()
                     .any(|tool| tool.get("type").and_then(Value::as_str) == Some("tool_search"))
                 {
-                    automatic_reply = Some(ModelReply::ToolSearch {
+                    automatic_reply = Some(ModelReply::CuaPreload {
                         call_id: format!(
                             "fkn-preload-{}",
                             self.sequence.fetch_add(1, Ordering::Relaxed)
@@ -316,10 +290,6 @@ impl Bridge {
         } else {
             self.model_request_ready.notify_waiters();
         }
-        if registry_changed {
-            self.notify_tool_list_changed().await;
-        }
-
         Ok(reply_rx)
     }
 
@@ -495,7 +465,7 @@ fn extract_tool_outputs(request: &Value) -> Vec<(String, Value)> {
         .collect()
 }
 
-fn extract_tool_search_outputs(request: &Value) -> Vec<Vec<Value>> {
+fn extract_cua_preload_outputs(request: &Value) -> Vec<Vec<Value>> {
     request
         .get("input")
         .and_then(Value::as_array)
@@ -506,8 +476,8 @@ fn extract_tool_search_outputs(request: &Value) -> Vec<Vec<Value>> {
         .collect()
 }
 
-fn merge_discovered_tools(registry: &mut Vec<Value>, discovered: Vec<Value>) {
-    for tool in discovered {
+fn merge_cua_preload_tools(registry: &mut Vec<Value>, preloaded_tools: Vec<Value>) {
+    for tool in preloaded_tools {
         let tool_type = tool.get("type").and_then(Value::as_str);
         let tool_name = tool.get("name").and_then(Value::as_str);
         let existing = registry.iter().position(|candidate| {
@@ -520,71 +490,6 @@ fn merge_discovered_tools(registry: &mut Vec<Value>, discovered: Vec<Value>) {
             registry.push(tool);
         }
     }
-}
-
-fn codex_output_to_call_tool_result(output: Value) -> CallToolResult {
-    let mut content = Vec::new();
-    let image_count = collect_mcp_content(&output, &mut content);
-    if content.is_empty() {
-        content.push(ContentBlock::text(match &output {
-            Value::String(text) => text.clone(),
-            _ => output.to_string(),
-        }));
-    }
-
-    let mut result = CallToolResult::success(content);
-    result.structured_content = Some(if image_count == 0 {
-        json!({"output": output})
-    } else {
-        json!({"content_count":result.content.len(),"image_count":image_count})
-    });
-    result
-}
-
-fn tool_execution_error(error: impl std::fmt::Display) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(error.to_string())])
-}
-
-fn collect_mcp_content(value: &Value, content: &mut Vec<ContentBlock>) -> usize {
-    match value {
-        Value::String(text) => {
-            content.push(ContentBlock::text(text.clone()));
-            0
-        }
-        Value::Array(items) => items
-            .iter()
-            .map(|item| collect_mcp_content(item, content))
-            .sum(),
-        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
-            Some("input_text" | "output_text" | "text") => {
-                if let Some(text) = object.get("text").and_then(Value::as_str) {
-                    content.push(ContentBlock::text(text.to_string()));
-                }
-                0
-            }
-            Some("input_image" | "image") => {
-                if let Some(image_url) = object.get("image_url").and_then(Value::as_str)
-                    && let Some((mime_type, data)) = parse_base64_data_url(image_url)
-                {
-                    content.push(ContentBlock::image(data, mime_type));
-                    return 1;
-                }
-                0
-            }
-            _ => 0,
-        },
-        _ => 0,
-    }
-}
-
-fn parse_base64_data_url(url: &str) -> Option<(String, String)> {
-    let rest = url.strip_prefix("data:")?;
-    let (metadata, data) = rest.split_once(',')?;
-    let mime_type = metadata.strip_suffix(";base64")?;
-    if mime_type.is_empty() || data.is_empty() {
-        return None;
-    }
-    Some((mime_type.to_string(), data.to_string()))
 }
 
 async fn responses_handler(
@@ -648,7 +553,7 @@ fn sse_response(response_id: String, reply: ModelReply) -> Response {
                 "item": item,
             }));
         }
-        ModelReply::ToolSearch {
+        ModelReply::CuaPreload {
             call_id,
             query,
             limit,
@@ -723,7 +628,7 @@ impl BridgeMcpHandler {
         vec![
             Self::tool(
                 "codex_skills_list",
-                "Discover the enabled Codex skills available for the configured workspace. Use this when the task may have a relevant Codex or plugin skill, or when you need to know the exact skill names before reading one. Results come from Codex's native skills/list catalog and include each skill's description, scope, plugin ID, enabled state, and canonical SKILL.md path. Do not guess skill names when this catalog can provide them.",
+                "List the enabled Codex skills available for this workspace. Call this exactly once on first use of this MCP server in a conversation, then read only relevant skills with codex_skill_get. The result is a compact catalog of exact skill names, descriptions, scopes, and plugin IDs; local paths and disabled skills are omitted. Repeat only when skills or plugins may have changed.",
                 json!({
                     "type":"object",
                     "properties":{
@@ -758,11 +663,7 @@ impl BridgeMcpHandler {
 
     fn tools_for_registry(registry: &[Value]) -> Vec<Tool> {
         let mut tools = Self::controller_tools();
-        for native in direct_tools(registry) {
-            if tools.iter().all(|tool| tool.name != native.definition.name) {
-                tools.push(native.definition);
-            }
-        }
+        tools.extend(exposed_native_tools(registry));
         tools
     }
 
@@ -785,12 +686,7 @@ impl BridgeMcpHandler {
 
 impl ServerHandler for BridgeMcpHandler {
     fn get_info(&self) -> ServerInfo {
-        let info = ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_tool_list_changed()
-                .build(),
-        );
+        let info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
         match self.bridge.server_instructions() {
             Some(instructions) => info.with_instructions(instructions),
             None => info,
@@ -806,10 +702,6 @@ impl ServerHandler for BridgeMcpHandler {
         Ok(ListToolsResult::with_all_items(
             self.tools_for_bridge(&registry),
         ))
-    }
-
-    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
-        self.bridge.register_peer(context.peer).await;
     }
 
     async fn call_tool(
@@ -844,13 +736,25 @@ impl ServerHandler for BridgeMcpHandler {
                 let tool = {
                     let state = self.bridge.state.lock().await;
                     find_direct_tool(&state.tools, name)
-                }
-                .ok_or_else(|| McpError::invalid_params(format!("unknown tool: {name}"), None))?;
+                };
+                let Some(tool) = tool else {
+                    if is_cua_tool(name) {
+                        return Ok(result_projection::cua_tool_unavailable(name).into());
+                    }
+                    return Err(McpError::invalid_params(
+                        format!("unknown tool: {name}"),
+                        None,
+                    ));
+                };
                 let payload = tool
                     .payload(args)
                     .map_err(|error| McpError::invalid_params(error, None))?;
                 match self.bridge.call_tool(tool, payload).await {
                     Ok(output) => Ok(codex_output_to_call_tool_result(output).into()),
+                    Err(error) if is_cua_tool(name) => {
+                        eprintln!("[bridge] CUA tool {name} is unavailable: {error:#}");
+                        Ok(result_projection::cua_tool_unavailable(name).into())
+                    }
                     Err(error) => Ok(tool_execution_error(error).into()),
                 }
             }

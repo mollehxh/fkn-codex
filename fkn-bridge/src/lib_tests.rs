@@ -1,4 +1,5 @@
 use super::*;
+use rmcp::model::ContentBlock;
 
 #[test]
 fn extracts_function_and_custom_tool_outputs() {
@@ -16,6 +17,76 @@ fn extracts_function_and_custom_tool_outputs() {
             ("a".to_string(), json!("one")),
             ("b".to_string(), json!({"ok":true})),
         ]
+    );
+}
+
+#[test]
+fn extracts_cua_preload_outputs() {
+    let request = json!({
+        "input": [
+            {
+                "type":"tool_search_output",
+                "call_id":"search-1",
+                "tools":[{"type":"function","name":"optional_tool"}]
+            },
+            {
+                "type":"tool_search_output",
+                "call_id":null,
+                "tools":[]
+            }
+        ]
+    });
+
+    assert_eq!(
+        extract_cua_preload_outputs(&request),
+        vec![
+            vec![json!({"type":"function","name":"optional_tool"})],
+            Vec::new(),
+        ]
+    );
+}
+
+#[test]
+fn skills_catalog_contains_only_compact_enabled_entries() {
+    let full_description = "Complete skill guidance. ".repeat(32);
+    let catalog = json!({
+        "data": [{
+            "cwd":"/private/workspace",
+            "skills":[
+                {
+                    "name":"plugin:useful",
+                    "description":full_description,
+                    "path":"/private/skills/useful/SKILL.md",
+                    "scope":"user",
+                    "enabled":true,
+                    "pluginId":"plugin@example"
+                },
+                {
+                    "name":"plugin:disabled",
+                    "description":"Disabled skill",
+                    "path":"/private/skills/disabled/SKILL.md",
+                    "scope":"user",
+                    "enabled":false
+                }
+            ],
+            "errors":[{"path":"/private/broken","message":"broken frontmatter"}]
+        }]
+    });
+
+    assert_eq!(
+        compact_skills_catalog(&catalog),
+        json!({
+            "skills":[{
+                "name":"plugin:useful",
+                "description":full_description,
+                "scope":"user",
+                "plugin_id":"plugin@example"
+            }],
+            "returned":1,
+            "total":1,
+            "truncated":false,
+            "errors":["broken frontmatter"]
+        })
     );
 }
 
@@ -39,6 +110,18 @@ fn publishes_available_native_tools_directly() {
             "description":"Apply a patch to workspace files."
         }),
         json!({
+            "type":"function",
+            "name":"write_stdin",
+            "description":"Write to a running command.",
+            "parameters":{"type":"object","properties":{"session_id":{"type":"integer"}}}
+        }),
+        json!({
+            "type":"function",
+            "name":"view_image",
+            "description":"View an image file.",
+            "parameters":{"type":"object","properties":{"path":{"type":"string"}}}
+        }),
+        json!({
             "type":"namespace", "name":"mcp__cua_repl", "tools":[{
                 "type":"function",
                 "name":"js",
@@ -51,6 +134,18 @@ fn publishes_available_native_tools_directly() {
                 }
             }]
         }),
+        json!({
+            "type":"function",
+            "name":"request_user_input",
+            "description":"Ask the user a question.",
+            "parameters":{"type":"object","properties":{}}
+        }),
+        json!({
+            "type":"function",
+            "name":"multi_agent_v1__spawn_agent",
+            "description":"Spawn an agent.",
+            "parameters":{"type":"object","properties":{}}
+        }),
     ];
     let tools = BridgeMcpHandler::tools_for_registry(&registry);
     let names = tools
@@ -58,11 +153,20 @@ fn publishes_available_native_tools_directly() {
         .map(|tool| tool.name.as_ref())
         .collect::<Vec<_>>();
 
-    assert!(names.contains(&"codex_skills_list"));
-    assert!(names.contains(&"codex_skill_get"));
-    assert!(names.contains(&"exec_command"));
-    assert!(names.contains(&"apply_patch"));
-    assert!(names.contains(&"mcp__cua_repl__js"));
+    assert_eq!(
+        names,
+        vec![
+            "codex_skills_list",
+            "codex_skill_get",
+            "exec_command",
+            "write_stdin",
+            "apply_patch",
+            "view_image",
+            "mcp__cua_repl__js",
+            "mcp__cua_repl__js_reset",
+            "mcp__cua_repl__js_add_node_module_dir",
+        ]
+    );
     assert_eq!(
         tools
             .iter()
@@ -79,21 +183,59 @@ fn publishes_available_native_tools_directly() {
             .input_schema["required"],
         json!(["input"])
     );
-    assert!(
+    assert_eq!(
         tools
             .iter()
             .find(|tool| tool.name.as_ref() == "mcp__cua_repl__js")
             .unwrap()
             .description
-            .as_deref()
-            .is_some_and(|description| description.contains("iab) is unavailable"))
+            .as_deref(),
+        Some("Control available browser and computer surfaces.")
     );
 
     let without_cua = BridgeMcpHandler::tools_for_registry(&registry[..2]);
-    assert!(
-        without_cua
-            .iter()
-            .all(|tool| tool.name.as_ref() != "mcp__cua_repl__js")
+    for name in tool_registry::CUA_TOOL_NAMES {
+        assert!(without_cua.iter().any(|tool| tool.name.as_ref() == name));
+    }
+}
+
+#[test]
+fn cua_fallback_tools_preserve_original_metadata() {
+    let tools = BridgeMcpHandler::tools_for_registry(&[]);
+    let js = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == "mcp__cua_repl__js")
+        .unwrap();
+    assert_eq!(
+        js.description.as_deref(),
+        Some(include_str!("cua_js_description_macos.md").trim_end())
+    );
+    assert_eq!(js.input_schema["required"], json!(["code"]));
+    assert_eq!(
+        js.input_schema["properties"]["timeout_ms"]["type"],
+        json!("integer")
+    );
+
+    let reset = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == "mcp__cua_repl__js_reset")
+        .unwrap();
+    assert_eq!(
+        reset.description.as_deref(),
+        Some(
+            "Reset the persistent cua_repl JavaScript session. All JavaScript bindings are discarded. The next cua_repl.js call initializes a fresh runtime for the enabled surfaces. This does not close browser tabs or native apps, or erase their state."
+        )
+    );
+    assert_eq!(reset.input_schema["properties"], json!({}));
+
+    let add_module_dir = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == "mcp__cua_repl__js_add_node_module_dir")
+        .unwrap();
+    assert_eq!(add_module_dir.input_schema["required"], json!(["path"]));
+    assert_eq!(
+        add_module_dir.input_schema["properties"]["path"]["type"],
+        json!("string")
     );
 }
 
@@ -108,8 +250,30 @@ fn tool_execution_failures_are_visible_to_the_model() {
     );
 }
 
+#[test]
+fn unavailable_cua_tool_returns_stable_actionable_error() {
+    for tool in tool_registry::CUA_TOOL_NAMES {
+        let result = result_projection::cua_tool_unavailable(tool);
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content,
+            Some(json!({
+                "ok":false,
+                "error":{
+                    "code":"tool_unavailable",
+                    "tool":tool,
+                    "message":"Computer Use is currently unavailable.",
+                    "requiredAction":"Open ChatGPT desktop app and make Computer Use available, then retry. If it remains unavailable, restart the connector.",
+                    "retryable":true
+                }
+            }))
+        );
+    }
+}
+
 #[tokio::test]
-async fn runtime_reset_removes_stale_direct_tools() {
+async fn runtime_reset_preserves_stable_public_tool_list() {
     let bridge = Bridge::default();
     bridge.state.lock().await.tools = vec![json!({
         "type":"function",
@@ -118,18 +282,29 @@ async fn runtime_reset_removes_stale_direct_tools() {
         "parameters":{"type":"object","properties":{}}
     })];
 
-    assert!(
-        BridgeMcpHandler::tools_for_registry(&bridge.state.lock().await.tools)
-            .iter()
-            .any(|tool| tool.name.as_ref() == "exec_command")
-    );
+    let before = BridgeMcpHandler::tools_for_registry(&bridge.state.lock().await.tools)
+        .into_iter()
+        .map(|tool| tool.name.into_owned())
+        .collect::<Vec<_>>();
 
     bridge.reset_runtime_registry().await;
 
-    assert!(
-        BridgeMcpHandler::tools_for_registry(&bridge.state.lock().await.tools)
-            .iter()
-            .all(|tool| tool.name.as_ref() != "exec_command")
+    let after = BridgeMcpHandler::tools_for_registry(&bridge.state.lock().await.tools)
+        .into_iter()
+        .map(|tool| tool.name.into_owned())
+        .collect::<Vec<_>>();
+
+    assert_eq!(before, after);
+    assert_eq!(
+        before,
+        vec![
+            "codex_skills_list",
+            "codex_skill_get",
+            "exec_command",
+            "mcp__cua_repl__js",
+            "mcp__cua_repl__js_reset",
+            "mcp__cua_repl__js_add_node_module_dir",
+        ]
     );
 }
 
@@ -161,10 +336,7 @@ fn codex_image_output_becomes_native_mcp_image_content() {
     ]);
     let result = codex_output_to_call_tool_result(output.clone());
 
-    assert_eq!(
-        result.structured_content,
-        Some(json!({"content_count":2,"image_count":1}))
-    );
+    assert_eq!(result.structured_content, None);
     assert_eq!(result.content.len(), 2);
     assert_eq!(result.content[0], ContentBlock::text("before"));
     assert_eq!(result.content[1], ContentBlock::image("AAAA", "image/png"));
@@ -178,8 +350,34 @@ fn malformed_image_output_keeps_the_structured_payload() {
     }]);
     let result = codex_output_to_call_tool_result(output.clone());
 
+    assert_eq!(
+        result.structured_content,
+        Some(json!({"output": output.clone()}))
+    );
+    assert_eq!(
+        result.content,
+        vec![ContentBlock::text(json!({"output": output}).to_string())]
+    );
+}
+
+#[test]
+fn mixed_output_preserves_native_content_and_unprojected_json() {
+    let output = json!([
+        {"type":"output_text","text":"useful text"},
+        {"status":"completed","answer":42}
+    ]);
+    let result = codex_output_to_call_tool_result(output.clone());
+
+    assert_eq!(result.content, vec![ContentBlock::text("useful text")]);
     assert_eq!(result.structured_content, Some(json!({"output": output})));
-    assert_eq!(result.content, vec![ContentBlock::text(output.to_string())]);
+}
+
+#[test]
+fn plain_text_output_is_not_duplicated_as_structured_content() {
+    let result = codex_output_to_call_tool_result(json!("command output"));
+
+    assert_eq!(result.content, vec![ContentBlock::text("command output")]);
+    assert_eq!(result.structured_content, None);
 }
 
 #[test]
@@ -196,9 +394,15 @@ fn mcp_server_instructions_include_bounded_local_codex_context() {
 
     assert!(instructions.len() <= server_context::MAX_SERVER_INSTRUCTIONS_BYTES);
     assert!(instructions.is_char_boundary(instructions.len()));
-    assert!(instructions.contains("Local Codex controller"));
-    assert!(instructions.contains("access=danger-full-access"));
-    assert!(instructions.contains("computer_use=enabled"));
+    assert!(instructions.contains("At the start of each conversation"));
+    assert!(instructions.contains("call `codex_skills_list` once"));
+    assert!(instructions.contains("Browser Use, Computer Use, or any CUA tool"));
+    assert!(instructions.contains("unless the user explicitly asks"));
+    assert!(instructions.contains("Report the unavailable tool and `requiredAction`, if provided"));
+    assert!(!instructions.contains("codex_tools_search"));
+    assert!(!instructions.contains("codex_tool_call"));
+    assert!(instructions.contains("danger-full-access"));
+    assert!(!instructions.contains("computer_use="));
 }
 
 #[test]
